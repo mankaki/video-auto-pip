@@ -2,7 +2,7 @@
 // @name         视频自动画中画
 // @namespace    http://tampermonkey.net/
 // @version      4.6.4
-// @description  利用原生属性实现的高稳定性自动画中画。支持标签页切换、窗口失焦触发、回页自动退出及网页全屏(Q键)。
+// @description  自动画中画，支持标签页切换、窗口失焦触发、回页自动退出，支持网页全屏。
 // @author       mankaki
 // @match        *://*/*
 // @grant        none
