@@ -1,4 +1,4 @@
-# 自动画中画 (Auto Picture-in-Picture)
+# 视频自动画中画 (Auto Picture-in-Picture)
 
 利用浏览器原生属性与脚本逻辑相结合，实现的极致稳定、简洁的视频自动画中画工具。
 
