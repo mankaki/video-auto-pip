@@ -35,11 +35,18 @@ const CONFIG = {
 
 ## 📦 安装方式
 
-1. 安装浏览器扩展 [Tampermonkey](https://www.tampermonkey.net/)。
-2. 创建新脚本，将 `auto-pip.user.js` 的内容粘贴并保存。
-3. 刷新视频网页即可使用。
+在使用本脚本前，请先安装浏览器扩展 [Tampermonkey](https://www.tampermonkey.net/)。
 
-## 📜 版本记录
+### 方法 A：通过 GreasyFork 安装 (推荐)
+1. [点击此处访问 GreasyFork 页面](https://greasyfork.org/zh-CN/scripts/562978-%E8%A7%86%E9%A2%91%E8%87%AA%E5%8A%A8%E7%94%BB%E4%B8%AD%E7%94%BB)。
+2. 点击“安装此脚本”按钮即可。
+
+### 方法 B：手动复制安装
+1. 点击 Tampermonkey 图标，选择“添加新脚本”。
+2. 将本代码仓库中的 `auto-pip.user.js` 内容完全覆盖粘贴。
+3. 按 `Ctrl+S` (或 `Cmd+S`) 保存即可。
+
+## � 逻辑说明版本记录
 *   **v4.5**: 支持暂停视频的 P 键开启。
 *   **v4.2 - v4.4**: 引入原生属性支持并解决手势限制。
 *   **v1.0 - v3.x**: 基础功能迭代及逻辑实验。
