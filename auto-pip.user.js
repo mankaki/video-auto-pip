@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频自动画中画
 // @namespace    http://tampermonkey.net/
-// @version      4.6.5
+// @version      4.6.6
 // @description  自动画中画，支持标签页切换、窗口失焦触发、回页自动退出，支持网页全屏。
 // @author       mankaki
 // @match        *://*/*
@@ -97,13 +97,22 @@
     }
 
     function setupVideo(video) {
-        if (video.dataset.pipObserved) return;
-        video.dataset.pipObserved = 'true';
-        video.autoPictureInPicture = true;
+        if (!video || video.dataset.pipObserved) return;
 
-        video.addEventListener('play', () => {
+        // 过滤小型视频(如广告、追踪器或背景音), 仅对宽>200px的视频生效
+        // 延迟检查以确保能够获取到正确的属性
+        setTimeout(() => {
+            if (!video || video.dataset.pipObserved) return;
+            if (video.offsetWidth < 200 && video.offsetHeight < 150) return;
+
+            video.dataset.pipObserved = 'true';
             video.autoPictureInPicture = true;
-        });
+
+            video.addEventListener('play', () => {
+                video.autoPictureInPicture = true;
+            });
+            log('info', '检测到播放器, 已应用自动画中画配置');
+        }, 1000);
     }
 
     function scanVideos() {
@@ -190,15 +199,22 @@
 
     window.addEventListener('blur', () => {
         if (!CONFIG.enabled || document.pictureInPictureElement || document.hidden) return;
-        const playing = Array.from(document.querySelectorAll('video')).find(v => !v.paused);
-        if (playing) enterPiP(playing, '窗口失焦');
+
+        // 增加 500ms 延迟确认，防止像“右键菜单弹出”等瞬时动作导致的误触发
+        setTimeout(() => {
+            if (!document.hasFocus() && !document.hidden && !document.pictureInPictureElement) {
+                const playing = Array.from(document.querySelectorAll('video')).find(v => !v.paused);
+                if (playing) enterPiP(playing, '窗口失焦');
+            }
+        }, 500);
     });
 
     window.addEventListener('focus', () => {
         if (!CONFIG.enabled) return;
+        // 增加一个小延迟, 确保浏览器状态切换完成
         setTimeout(() => {
             if (document.hasFocus()) exitPiP();
-        }, 200);
+        }, 300);
     });
 
     document.addEventListener('visibilitychange', () => {
@@ -207,7 +223,7 @@
     });
 
     function init() {
-        log('info', '脚本已加载 v4.6.5');
+        log('info', '脚本已加载 v4.6.6');
         scanVideos();
         observer.observe(document.body, { childList: true, subtree: true });
         document.addEventListener('mousedown', () => {
