@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频自动画中画
 // @namespace    http://tampermonkey.net/
-// @version      4.6.4
+// @version      4.6.5
 // @description  自动画中画，支持标签页切换、窗口失焦触发、回页自动退出，支持网页全屏。
 // @author       mankaki
 // @match        *://*/*
@@ -59,9 +59,15 @@
         else console.log(prefix, ...args);
     }
 
+    let lastActionTime = 0;
+    const ACTION_COOLDOWN = 1000; // 冷却时间：1秒内不重复进行画中画切换
+
     async function exitPiP() {
+        if (!CONFIG.enabled || Date.now() - lastActionTime < ACTION_COOLDOWN) return;
+
         if (document.pictureInPictureElement) {
             try {
+                lastActionTime = Date.now();
                 await document.exitPictureInPicture();
                 log('info', '返回页面, 自动退出画中画');
             } catch (err) { }
@@ -69,9 +75,10 @@
     }
 
     async function enterPiP(video, trigger) {
-        if (!video || document.pictureInPictureElement) return;
+        if (!video || document.pictureInPictureElement || Date.now() - lastActionTime < ACTION_COOLDOWN) return;
 
         try {
+            lastActionTime = Date.now();
             await video.requestPictureInPicture();
             log('info', `成功通过 [${trigger}] 开启画中画`);
         } catch (err) {
@@ -200,7 +207,7 @@
     });
 
     function init() {
-        log('info', '脚本已加载 v4.6.4');
+        log('info', '脚本已加载 v4.6.5');
         scanVideos();
         observer.observe(document.body, { childList: true, subtree: true });
         document.addEventListener('mousedown', () => {
