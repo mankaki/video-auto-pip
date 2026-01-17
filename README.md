@@ -41,10 +41,10 @@ const CONFIG = {
 1. [点击此处访问 GreasyFork 页面](https://greasyfork.org/zh-CN/scripts/562978-%E8%A7%86%E9%A2%91%E8%87%AA%E5%8A%A8%E7%94%BB%E4%B8%AD%E7%94%BB)。
 2. 点击“安装此脚本”按钮即可。
 
-### 方法 B：手动复制安装
-1. 点击 Tampermonkey 图标，选择“添加新脚本”。
-2. 将本代码仓库中的 `auto-pip.user.js` 内容完全覆盖粘贴。
-3. 按 `Ctrl+S` (或 `Cmd+S`) 保存即可。
+### 方法 B：通过 GitHub 原地址安装
+1. [点击此处访问脚本原地址](https://github.com/mankaki/video-auto-pip/raw/refs/heads/main/auto-pip.user.js)。
+2. 浏览器通常会自动识别并弹出 Tampermonkey 安装确认页面。
+3. 如果没有自动弹出，请手动全选复制页面代码，并在 Tampermonkey 中新建脚本粘贴保存。
 
 ## 📜 版本记录
 *   **v4.5**: 支持暂停视频的 P 键开启。
