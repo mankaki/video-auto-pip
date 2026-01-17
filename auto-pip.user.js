@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         视频自动画中画
 // @namespace    http://tampermonkey.net/
-// @version      4.5.1
-// @description  利用原生属性实现的高稳定性自动画中画。支持标签页切换、窗口失焦触发及回页自动退出。
+// @version      4.6.4
+// @description  利用原生属性实现的高稳定性自动画中画。支持标签页切换、窗口失焦触发、回页自动退出及网页全屏(Q键)。
 // @author       mankaki
 // @match        *://*/*
 // @grant        none
@@ -18,6 +18,38 @@
     };
 
     let hasUserGesture = false;
+
+    // 网页全屏样式注入
+    const style = document.createElement('style');
+    style.textContent = `
+        .pip-web-fullscreen-container {
+            position: fixed !important;
+            top: 0 !important;
+            left: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            z-index: 2147483647 !important;
+            background: #000 !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+        }
+        .pip-web-fullscreen-container video {
+            width: 100% !important;
+            height: 100% !important;
+            max-width: 100vw !important;
+            max-height: 100vh !important;
+            object-fit: contain !important;
+        }
+        body.pip-web-fs-active {
+            overflow: hidden !important;
+        }
+        /* 强制隐藏阻挡全屏的元素层级 */
+        .pip-web-fs-active .pip-web-fullscreen-container ~ * {
+            z-index: auto !important;
+        }
+    `;
+    document.head.appendChild(style);
 
     function log(type, ...args) {
         if (!CONFIG.debug) return;
@@ -60,8 +92,6 @@
     function setupVideo(video) {
         if (video.dataset.pipObserved) return;
         video.dataset.pipObserved = 'true';
-
-        // 原生属性: 针对标签页切换的最稳方案
         video.autoPictureInPicture = true;
 
         video.addEventListener('play', () => {
@@ -78,20 +108,69 @@
             await exitPiP();
             return;
         }
-
         const allVideos = Array.from(document.querySelectorAll('video')).filter(v => v.readyState >= 2);
         if (allVideos.length === 0) return;
-
-        // 优先选择播放中的, 其次选择页面第一个(支持暂停视频)
         let target = allVideos.find(v => !v.paused) || allVideos[0];
         if (target) await enterPiP(target, '快捷键 P');
     }
 
+    // 寻找可能的播放器容器
+    function findPlayerContainer(video) {
+        let container = video.parentElement;
+        const videoRect = video.getBoundingClientRect();
+
+        let current = video.parentElement;
+        let depth = 0;
+        while (current && current !== document.body && depth < 5) {
+            const rect = current.getBoundingClientRect();
+            const className = (current.className || '').toLowerCase();
+            if (className.includes('player') || className.includes('video-container') ||
+                (Math.abs(rect.width - videoRect.width) < 50 && Math.abs(rect.height - videoRect.height) < 50)) {
+                container = current;
+            }
+            if (rect.width > videoRect.width * 1.5) break;
+            current = current.parentElement;
+            depth++;
+        }
+        return container;
+    }
+
+    function toggleWebFullscreen() {
+        const allVideos = Array.from(document.querySelectorAll('video')).filter(v => v.readyState >= 2);
+        if (allVideos.length === 0) return;
+        let video = allVideos.find(v => !v.paused) || allVideos[0];
+        if (!video) return;
+
+        const container = findPlayerContainer(video);
+        const isFS = container.classList.contains('pip-web-fullscreen-container');
+
+        if (isFS) {
+            container.classList.remove('pip-web-fullscreen-container');
+            document.body.classList.remove('pip-web-fs-active');
+            log('info', '退出网页全屏');
+        } else {
+            document.querySelectorAll('.pip-web-fullscreen-container').forEach(el => el.classList.remove('pip-web-fullscreen-container'));
+            container.classList.add('pip-web-fullscreen-container');
+            document.body.classList.add('pip-web-fs-active');
+            log('info', '进入网页全屏, 容器:', container.tagName + (container.className ? '.' + container.className : ''));
+        }
+    }
+
     document.addEventListener('keydown', (e) => {
-        if ((e.key === 'p' || e.key === 'P') &&
-            !['INPUT', 'TEXTAREA'].includes(e.target.tagName) &&
-            !e.target.isContentEditable) {
-            toggleManualPiP();
+        if (['INPUT', 'TEXTAREA'].includes(e.target.tagName) || e.target.isContentEditable) return;
+
+        const key = e.key.toLowerCase();
+        if (key === 'p' || key === 'q') {
+            // 阻止事件传递给其他监听器和浏览器默认行为
+            e.preventDefault();
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+
+            if (key === 'p') {
+                toggleManualPiP();
+            } else if (key === 'q') {
+                toggleWebFullscreen();
+            }
         }
     }, true);
 
@@ -102,14 +181,12 @@
         }));
     });
 
-    // 监听窗口失焦 (App 切换)
     window.addEventListener('blur', () => {
         if (!CONFIG.enabled || document.pictureInPictureElement || document.hidden) return;
         const playing = Array.from(document.querySelectorAll('video')).find(v => !v.paused);
         if (playing) enterPiP(playing, '窗口失焦');
     });
 
-    // 监听窗口聚焦 (切回页面)
     window.addEventListener('focus', () => {
         if (!CONFIG.enabled) return;
         setTimeout(() => {
@@ -117,17 +194,15 @@
         }, 200);
     });
 
-    // 监听可见性变化 (针对切回标签页时的原生恢复逻辑)
     document.addEventListener('visibilitychange', () => {
         if (!CONFIG.enabled) return;
         if (!document.hidden) log('info', '检测到返回, 正在恢复视频...');
     });
 
     function init() {
-        log('info', '脚本已加载 v4.5.1');
+        log('info', '脚本已加载 v4.6.4');
         scanVideos();
         observer.observe(document.body, { childList: true, subtree: true });
-
         document.addEventListener('mousedown', () => {
             hasUserGesture = true;
             log('info', '手势已激活, 自动触发功能已就绪。');
