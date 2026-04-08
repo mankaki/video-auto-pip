@@ -49,6 +49,7 @@ const CONFIG = {
 3. 如果没有自动弹出，请手动全选复制页面代码，并在 Tampermonkey 中新建脚本粘贴保存。
 
 ## 📜 版本记录
+*   **v4.8.3**: 骨灰级性能与鲁棒性调优。重构 ResizeObserver 为单一实例避免内存泄漏；引入防抖机制控制 MutationObserver 防止大规模 DOM 变动时的帧率掉底；修复点击页面 iframe 误触画中画；添加返回原页兜底退出、ESC 退出网页全屏及所有触屏手势响应的支持。
 *   **v4.8.2**: 可靠性大幅调优。交互保护策略缩短为 300ms（解决 ALT-TAB 失效），增强 Shadow DOM 监测及 playing 属性守护。
 *   **v4.8**: 兼容性大跃进。支持 Shadow DOM 深度扫描、启用 `@allFrames` 穿透 iframe、优化动态加载视频检测。
 *   **v4.7**: 引入特定站点(MGTV)兼容性优化。

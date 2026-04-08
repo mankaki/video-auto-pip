@@ -106,42 +106,46 @@
         return videos;
     }
 
+    // 全局单例重置尺寸监听器，避免为每个未达到尺寸的视频单独创建而引发内存泄露
+    const SharedResizeObserver = new ResizeObserver((entries) => {
+        for (let entry of entries) {
+            const { width, height } = entry.contentRect;
+            const video = entry.target;
+            if (width >= 200 || height >= 150) {
+                applyPipConfig(video);
+                SharedResizeObserver.unobserve(video);
+            }
+        }
+    });
+
+    function applyPipConfig(video) {
+        if (video.dataset.pipObserved) return;
+        video.dataset.pipObserved = 'true';
+
+        // 属性强效守护：确保 autoPictureInPicture 始终启用
+        const enforceNative = () => {
+            if (video.autoPictureInPicture !== true) {
+                video.autoPictureInPicture = true;
+                log('debug', '重新锁定原生自动画中画属性');
+            }
+        };
+
+        enforceNative();
+        video.addEventListener('play', enforceNative);
+        video.addEventListener('playing', enforceNative);
+
+        log('info', '检测到有效播放器, 已应用配置');
+    }
+
     function setupVideo(video) {
         if (!video || video.dataset.pipObserved) return;
 
-        let attempts = 0;
-        const maxAttempts = 20;
-
-        const checkSize = setInterval(() => {
-            attempts++;
-            if (!video || video.dataset.pipObserved) {
-                clearInterval(checkSize);
-                return;
-            }
-
-            const isVisible = video.offsetWidth >= 200 || video.offsetHeight >= 150;
-            if (isVisible) {
-                clearInterval(checkSize);
-                video.dataset.pipObserved = 'true';
-
-                // 属性强效守护：确保 autoPictureInPicture 始终启用
-                const enforceNative = () => {
-                    if (video.autoPictureInPicture !== true) {
-                        video.autoPictureInPicture = true;
-                        log('debug', '重新锁定原生自动画中画属性');
-                    }
-                };
-
-                enforceNative();
-                video.addEventListener('play', enforceNative);
-                video.addEventListener('playing', enforceNative);
-
-                log('info', '检测到有效播放器, 已应用配置');
-            } else if (attempts >= maxAttempts) {
-                clearInterval(checkSize);
-                log('debug', '放弃追踪过小的视频元素:', video.src || 'blob/stream');
-            }
-        }, 500);
+        if (video.offsetWidth >= 200 || video.offsetHeight >= 150) {
+            applyPipConfig(video);
+        } else {
+            // 如果尺寸不够，交给全局监听器，不要在此新建监听
+            SharedResizeObserver.observe(video);
+        }
     }
 
     function scanVideos() {
@@ -161,6 +165,8 @@
 
     function findPlayerContainer(video) {
         let container = video.parentElement;
+        if (!container) return video; // 防御：遇到游离的 video 节点直接返回自身
+
         const videoRect = video.getBoundingClientRect();
         let current = video.parentElement;
         let depth = 0;
@@ -175,7 +181,7 @@
             current = current.parentElement;
             depth++;
         }
-        return container;
+        return container || video;
     }
 
     function toggleWebFullscreen() {
@@ -203,6 +209,13 @@
         lastInteractionTime = Date.now();
         if (['INPUT', 'TEXTAREA'].includes(e.target.tagName) || e.target.isContentEditable) return;
         const key = e.key.toLowerCase();
+        
+        // 支持按 ESC 退出网页全屏
+        if (key === 'escape' && document.body.classList.contains('pip-web-fs-active')) {
+            toggleWebFullscreen();
+            return;
+        }
+        
         if (key === 'p' || key === 'q') {
             e.preventDefault();
             e.stopPropagation();
@@ -212,29 +225,53 @@
         }
     }, true);
 
+    let scanTimeout = null;
     const observer = new MutationObserver(mutations => {
+        let hasPotentialNodes = false;
         mutations.forEach(m => m.addedNodes.forEach(node => {
-            if (node.tagName === 'VIDEO') setupVideo(node);
-            else if (node.nodeType === Node.ELEMENT_NODE) {
-                // 深度扫描新加入的节点 (包括 Shadow DOM)
-                findVideosDeep(node).forEach(setupVideo);
+            if (node.nodeType !== Node.ELEMENT_NODE) return;
+            if (node.tagName === 'VIDEO') {
+                setupVideo(node);
+            } else {
+                hasPotentialNodes = true;
             }
         }));
+        
+        // 防抖：如果有很多节点被连续插入(例如信息流滚动)，只在最后一次性整体扫描
+        // 从而避免 TreeWalker 陷入深渊级的重度算力消耗
+        if (hasPotentialNodes) {
+            if (scanTimeout) clearTimeout(scanTimeout);
+            scanTimeout = setTimeout(() => {
+                scanVideos(); // 重复检测有防重入机制，所以直接全局重扫代价反而比遍历几十次 subtree 要小得多
+                scanTimeout = null;
+            }, 800);
+        }
     });
 
     window.addEventListener('blur', () => {
         if (!CONFIG.enabled || document.pictureInPictureElement || document.hidden) return;
 
+        // 陷阱防御：如果是因为点击了页面内的 iframe (例如评论区/内嵌推文) 导致的 blur，应直接忽略
+        if (document.activeElement && document.activeElement.tagName === 'IFRAME') {
+            log('debug', '焦点转移到了 iframe 内部，属于页内交互，忽略失焦。');
+            return;
+        }
+
         // 调优：交互保护缩短至 300ms，确保 ALT-TAB 切换足够灵敏
-        if (Date.now() - lastInteractionTime < 300) {
+        const blurInteractionTime = lastInteractionTime;
+        if (Date.now() - blurInteractionTime < 300) {
             log('debug', '近期有点击交互，忽略失焦触发。');
             return;
         }
 
         setTimeout(() => {
             if (!document.hasFocus() && !document.hidden && !document.pictureInPictureElement) {
-                if (Date.now() - lastInteractionTime < 300) return;
-                const playing = findVideosDeep().find(v => !v.paused);
+                if (lastInteractionTime > blurInteractionTime) {
+                    log('debug', '延迟期间出现新交互，中止画中画触发。');
+                    return;
+                }
+                // 确保触发的视频至少已加载了元数据(readyState >= 1)而且没有停播
+                const playing = findVideosDeep().find(v => !v.paused && v.readyState >= 1);
                 if (playing) enterPiP(playing, '窗口失焦');
             }
         }, 500);
@@ -247,7 +284,10 @@
 
     document.addEventListener('visibilitychange', () => {
         if (!CONFIG.enabled) return;
-        if (!document.hidden) log('info', '检测到返回, 正在检查状态...');
+        if (!document.hidden) {
+            log('info', '检测到页面恢复可见, 执行兜底退出检查...');
+            exitPiP(); // 比 focus 更可靠的恢复判定
+        }
     });
 
     function init() {
@@ -256,7 +296,8 @@
         scanVideos();
         observer.observe(document.body, { childList: true, subtree: true });
 
-        document.addEventListener('mousedown', () => {
+        // 支持触控设备，涵盖鼠标与触摸(iPad等)
+        document.addEventListener('pointerdown', () => {
             hasUserGesture = true;
             lastInteractionTime = Date.now();
             log('info', '手势已激活。');
