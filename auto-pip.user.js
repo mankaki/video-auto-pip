@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频自动画中画
 // @namespace    http://tampermonkey.net/
-// @version      4.8.2
+// @version      4.8.3
 // @description  自动画中画，支持标签页切换、窗口失焦触发、回页自动退出，支持网页全屏
 // @author       mankaki
 // @match        *://*/*
@@ -209,13 +209,13 @@
         lastInteractionTime = Date.now();
         if (['INPUT', 'TEXTAREA'].includes(e.target.tagName) || e.target.isContentEditable) return;
         const key = e.key.toLowerCase();
-        
+
         // 支持按 ESC 退出网页全屏
         if (key === 'escape' && document.body.classList.contains('pip-web-fs-active')) {
             toggleWebFullscreen();
             return;
         }
-        
+
         if (key === 'p' || key === 'q') {
             e.preventDefault();
             e.stopPropagation();
@@ -236,7 +236,7 @@
                 hasPotentialNodes = true;
             }
         }));
-        
+
         // 防抖：如果有很多节点被连续插入(例如信息流滚动)，只在最后一次性整体扫描
         // 从而避免 TreeWalker 陷入深渊级的重度算力消耗
         if (hasPotentialNodes) {
