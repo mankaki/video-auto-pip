@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频自动画中画
 // @namespace    http://tampermonkey.net/
-// @version      4.8.3
+// @version      4.9.3
 // @description  自动画中画，支持标签页切换、窗口失焦触发、回页自动退出，支持网页全屏
 // @author       mankaki
 // @match        *://*/*
@@ -19,8 +19,9 @@
         isMgtv: location.hostname.includes('mgtv.com')
     };
 
-    let hasUserGesture = false;
-    let lastInteractionTime = 0; // 记录最后一次用户与页面交互的时间
+    let hasEverInteracted = false;
+    let iframeBlurPending = false; // 标记：是否刚点击了 iframe 等嵌入元素（可能导致假 blur）
+    let webFullscreenSession = null;
 
     // 网页全屏样式注入
     const style = document.createElement('style');
@@ -36,6 +37,8 @@
             display: flex !important;
             align-items: center !important;
             justify-content: center !important;
+            margin: 0 !important;
+            padding: 0 !important;
         }
         .pip-web-fullscreen-container video {
             width: 100% !important;
@@ -47,8 +50,8 @@
         body.pip-web-fs-active {
             overflow: hidden !important;
         }
-        .pip-web-fs-active .pip-web-fullscreen-container ~ * {
-            z-index: auto !important;
+        .pip-web-fullscreen-anchor {
+            display: none !important;
         }
     `;
     document.head.appendChild(style);
@@ -64,6 +67,14 @@
     let lastActionTime = 0;
     const ACTION_COOLDOWN = 500; // 调优：减少冷却时间，响应更快速
 
+    function getActivationState() {
+        const activation = navigator.userActivation;
+        return {
+            isActive: !!activation?.isActive,
+            hasBeenActive: !!activation?.hasBeenActive
+        };
+    }
+
     async function exitPiP() {
         if (!CONFIG.enabled || Date.now() - lastActionTime < ACTION_COOLDOWN) return;
         if (document.pictureInPictureElement) {
@@ -76,16 +87,31 @@
     }
 
     async function enterPiP(video, trigger) {
-        if (!video || document.pictureInPictureElement || Date.now() - lastActionTime < ACTION_COOLDOWN) return;
+        const activation = getActivationState();
+        log('info', `>>> enterPiP 调用: trigger=${trigger}, hasVideo=${!!video}, alreadyPiP=${!!document.pictureInPictureElement}, cooldown=${Date.now() - lastActionTime}ms, activation=${activation.isActive}/${activation.hasBeenActive}`);
+        if (!video || document.pictureInPictureElement || Date.now() - lastActionTime < ACTION_COOLDOWN) {
+            log('info', `>>> enterPiP 被拦截: noVideo=${!video}, alreadyPiP=${!!document.pictureInPictureElement}, inCooldown=${Date.now() - lastActionTime < ACTION_COOLDOWN}`);
+            return;
+        }
+        if (trigger.startsWith('窗口失焦') && !activation.isActive) {
+            log('warn', '窗口失焦时当前没有瞬时用户激活，跳过 requestPictureInPicture 调用；若是标签切换，交给浏览器原生 autoPictureInPicture 处理。');
+            return;
+        }
         try {
             lastActionTime = Date.now();
             await video.requestPictureInPicture();
             log('info', `成功通过 [${trigger}] 开启画中画`);
         } catch (err) {
-            if (err.message.includes('user gesture')) {
-                log('warn', `受限于安全策略, [${trigger}] 需先点击页面激活。`);
-                if (!hasUserGesture) {
-                    console.log('%c 👉 提示: 请点击网页任意位置，激活“自动画中画”功能！ ', 'background: #ffcc00; color: #000; font-weight: bold; padding: 5px;');
+            lastActionTime = 0; // 失败时重置冷却，允许立即重试
+            log('error', `>>> enterPiP 异常: ${err.name}: ${err.message}`);
+            const isGestureError = err.name === 'NotAllowedError' || err.message.includes('user gesture');
+            if (isGestureError) {
+                const latestActivation = getActivationState();
+                log('warn', `受限于安全策略, [${trigger}] 调用当下缺少瞬时用户激活: activation=${latestActivation.isActive}/${latestActivation.hasBeenActive}, everInteracted=${hasEverInteracted}`);
+                if (trigger.startsWith('窗口失焦')) {
+                    log('warn', '当前 Chromium 策略下，切到别的应用时无法复用之前的页面点击手势；标签切换可继续依赖原生 autoPictureInPicture。');
+                } else if (!hasEverInteracted) {
+                    console.log('%c 提示: 请先与页面交互，再使用快捷键 P 手动触发画中画。', 'background: #ffcc00; color: #000; font-weight: bold; padding: 5px;');
                 }
             } else {
                 log('error', `${trigger} 失败:`, err.message);
@@ -163,25 +189,27 @@
         if (target) await enterPiP(target, '快捷键 P');
     }
 
-    function findPlayerContainer(video) {
-        let container = video.parentElement;
-        if (!container) return video; // 防御：遇到游离的 video 节点直接返回自身
+    function exitWebFullscreen() {
+        if (!webFullscreenSession) return;
 
-        const videoRect = video.getBoundingClientRect();
-        let current = video.parentElement;
-        let depth = 0;
-        while (current && current !== document.body && depth < 5) {
-            const rect = current.getBoundingClientRect();
-            const className = (current.className || '').toLowerCase();
-            if (className.includes('player') || className.includes('video-container') ||
-                (Math.abs(rect.width - videoRect.width) < 50 && Math.abs(rect.height - videoRect.height) < 50)) {
-                container = current;
-            }
-            if (rect.width > videoRect.width * 1.5) break;
-            current = current.parentElement;
-            depth++;
+        const { video, anchor, overlay, previousInlineStyle } = webFullscreenSession;
+        const fallbackParent = anchor?.parentNode || document.body;
+
+        if (anchor?.parentNode) {
+            anchor.parentNode.insertBefore(video, anchor);
+            anchor.remove();
+        } else if (overlay?.contains(video)) {
+            fallbackParent.appendChild(video);
         }
-        return container || video;
+
+        overlay?.remove();
+        document.body.classList.remove('pip-web-fs-active');
+
+        if (previousInlineStyle === null) video.removeAttribute('style');
+        else video.setAttribute('style', previousInlineStyle);
+
+        webFullscreenSession = null;
+        log('info', '退出网页全屏');
     }
 
     function toggleWebFullscreen() {
@@ -190,29 +218,41 @@
         let video = allVideos.find(v => !v.paused) || allVideos[0];
         if (!video) return;
 
-        const container = findPlayerContainer(video);
-        const isFS = container.classList.contains('pip-web-fullscreen-container');
-
-        if (isFS) {
-            container.classList.remove('pip-web-fullscreen-container');
-            document.body.classList.remove('pip-web-fs-active');
-            log('info', '退出网页全屏');
-        } else {
-            document.querySelectorAll('.pip-web-fullscreen-container').forEach(el => el.classList.remove('pip-web-fullscreen-container'));
-            container.classList.add('pip-web-fullscreen-container');
-            document.body.classList.add('pip-web-fs-active');
-            log('info', '进入网页全屏, 容器:', container.tagName);
+        if (webFullscreenSession?.video === video) {
+            exitWebFullscreen();
+            return;
         }
+        if (webFullscreenSession) exitWebFullscreen();
+
+        const parent = video.parentNode;
+        if (!parent) return;
+
+        const anchor = document.createElement('div');
+        anchor.className = 'pip-web-fullscreen-anchor';
+        const overlay = document.createElement('div');
+        overlay.className = 'pip-web-fullscreen-container';
+        const previousInlineStyle = video.getAttribute('style');
+
+        parent.insertBefore(anchor, video);
+        overlay.appendChild(video);
+        document.body.appendChild(overlay);
+        document.body.classList.add('pip-web-fs-active');
+        video.style.removeProperty('max-width');
+        video.style.removeProperty('max-height');
+        video.style.removeProperty('width');
+        video.style.removeProperty('height');
+
+        webFullscreenSession = { video, anchor, overlay, previousInlineStyle };
+        log('info', '进入网页全屏, 目标: VIDEO');
     }
 
     document.addEventListener('keydown', (e) => {
-        lastInteractionTime = Date.now();
         if (['INPUT', 'TEXTAREA'].includes(e.target.tagName) || e.target.isContentEditable) return;
         const key = e.key.toLowerCase();
 
         // 支持按 ESC 退出网页全屏
         if (key === 'escape' && document.body.classList.contains('pip-web-fs-active')) {
-            toggleWebFullscreen();
+            exitWebFullscreen();
             return;
         }
 
@@ -249,32 +289,43 @@
     });
 
     window.addEventListener('blur', () => {
-        if (!CONFIG.enabled || document.pictureInPictureElement || document.hidden) return;
+        const activation = getActivationState();
+        log('info', `>>> blur 触发! enabled=${CONFIG.enabled}, pipEl=${!!document.pictureInPictureElement}, hidden=${document.hidden}, hasFocus=${document.hasFocus()}, activeEl=${document.activeElement?.tagName}, iframePending=${iframeBlurPending}, activation=${activation.isActive}/${activation.hasBeenActive}, everInteracted=${hasEverInteracted}`);
 
-        // 陷阱防御：如果是因为点击了页面内的 iframe (例如评论区/内嵌推文) 导致的 blur，应直接忽略
+        if (!CONFIG.enabled || document.pictureInPictureElement || document.hidden) {
+            log('debug', '前置条件不满足，跳过。');
+            return;
+        }
+
+        // 防御1：焦点转移到页内 iframe
         if (document.activeElement && document.activeElement.tagName === 'IFRAME') {
             log('debug', '焦点转移到了 iframe 内部，属于页内交互，忽略失焦。');
             return;
         }
 
-        // 调优：交互保护缩短至 300ms，确保 ALT-TAB 切换足够灵敏
-        const blurInteractionTime = lastInteractionTime;
-        if (Date.now() - blurInteractionTime < 300) {
-            log('debug', '近期有点击交互，忽略失焦触发。');
+        // 防御2：刚刚点击了 iframe/embed/object 元素导致的 blur
+        if (iframeBlurPending) {
+            iframeBlurPending = false;
+            log('debug', '检测到 iframe 点击导致的失焦，忽略。');
             return;
         }
 
-        setTimeout(() => {
-            if (!document.hasFocus() && !document.hidden && !document.pictureInPictureElement) {
-                if (lastInteractionTime > blurInteractionTime) {
-                    log('debug', '延迟期间出现新交互，中止画中画触发。');
-                    return;
+        // 直接同步尝试触发画中画
+        const allVideos = findVideosDeep();
+        const playing = allVideos.find(v => !v.paused && v.readyState >= 1);
+        log('info', `>>> 视频搜索: 总数=${allVideos.length}, 播放中=${playing ? 'YES readyState=' + playing.readyState : 'NO'}, cooldown剩余=${Math.max(0, ACTION_COOLDOWN - (Date.now() - lastActionTime))}ms`);
+
+        if (playing) {
+            enterPiP(playing, '窗口失焦');
+        } else {
+            setTimeout(() => {
+                if (!document.hasFocus() && !document.hidden && !document.pictureInPictureElement) {
+                    const retryPlaying = findVideosDeep().find(v => !v.paused && v.readyState >= 1);
+                    log('info', `>>> 延迟重试: 播放中=${retryPlaying ? 'YES' : 'NO'}`);
+                    if (retryPlaying) enterPiP(retryPlaying, '窗口失焦(延迟重试)');
                 }
-                // 确保触发的视频至少已加载了元数据(readyState >= 1)而且没有停播
-                const playing = findVideosDeep().find(v => !v.paused && v.readyState >= 1);
-                if (playing) enterPiP(playing, '窗口失焦');
-            }
-        }, 500);
+            }, 500);
+        }
     });
 
     window.addEventListener('focus', () => {
@@ -291,16 +342,22 @@
     });
 
     function init() {
-        log('info', `脚本已加载 v4.8.2 [${window.self === window.top ? 'Main' : 'Iframe'}]`);
+        log('info', `脚本已加载 v4.9.3 [${window.self === window.top ? 'Main' : 'Iframe'}]`);
         if (CONFIG.isMgtv) log('info', '检测到 MGTV, 已应用增强兼容性配置。');
         scanVideos();
         observer.observe(document.body, { childList: true, subtree: true });
 
         // 支持触控设备，涵盖鼠标与触摸(iPad等)
-        document.addEventListener('pointerdown', () => {
-            hasUserGesture = true;
-            lastInteractionTime = Date.now();
-            log('info', '手势已激活。');
+        document.addEventListener('pointerdown', (e) => {
+            hasEverInteracted = true;
+            // 点击 iframe/embed/object 可能导致窗口 blur，设置标记以忽略该次 blur
+            if (e.target && (e.target.tagName === 'IFRAME' || e.target.tagName === 'EMBED' || e.target.tagName === 'OBJECT')) {
+                iframeBlurPending = true;
+                setTimeout(() => { iframeBlurPending = false; }, 500);
+                log('info', `记录到页面交互（iframe/嵌入元素点击），activation=${getActivationState().isActive}/${getActivationState().hasBeenActive}`);
+            } else {
+                log('info', `记录到页面交互，activation=${getActivationState().isActive}/${getActivationState().hasBeenActive}`);
+            }
         }, true);
     }
 
