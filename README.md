@@ -50,6 +50,7 @@ const CONFIG = {
 3. 如果没有自动弹出，请手动全选复制页面代码，并在 Tampermonkey 中新建脚本粘贴保存。
 
 ## 📜 版本记录
+*   **v4.9.4**: 修复切回视频页后画中画退出但画面黑屏、只剩声音的问题。回页退出改为去抖调度避免抢跑，并在 `leavepictureinpicture` 后主动刷新视频渲染层。
 *   **v4.9.3**: 修正手势模型说明与日志。改为基于真实 `navigator.userActivation` 判断是否可调用 `requestPictureInPicture()`，避免把“曾经点击过页面”误判为可长期复用的授权；补充 Chromium 在“切到别的应用”场景下的限制提示。
 *   **v4.8.3**: 骨灰级性能与鲁棒性调优。重构 ResizeObserver 为单一实例避免内存泄漏；引入防抖机制控制 MutationObserver 防止大规模 DOM 变动时的帧率掉底；修复点击页面 iframe 误触画中画；添加返回原页兜底退出、ESC 退出网页全屏及所有触屏手势响应的支持。
 *   **v4.8.2**: 可靠性大幅调优。交互保护策略缩短为 300ms（解决 ALT-TAB 失效），增强 Shadow DOM 监测及 playing 属性守护。

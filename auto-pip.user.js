@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频自动画中画
 // @namespace    http://tampermonkey.net/
-// @version      4.9.3
+// @version      4.9.4
 // @description  自动画中画，支持标签页切换、窗口失焦触发、回页自动退出，支持网页全屏
 // @author       mankaki
 // @match        *://*/*
@@ -22,6 +22,7 @@
     let hasEverInteracted = false;
     let iframeBlurPending = false; // 标记：是否刚点击了 iframe 等嵌入元素（可能导致假 blur）
     let webFullscreenSession = null;
+    let returnToPageTimer = null;
 
     // 网页全屏样式注入
     const style = document.createElement('style');
@@ -73,6 +74,31 @@
             isActive: !!activation?.isActive,
             hasBeenActive: !!activation?.hasBeenActive
         };
+    }
+
+    function scheduleReturnToPageExit(delay = 180) {
+        if (!CONFIG.enabled) return;
+        if (returnToPageTimer) clearTimeout(returnToPageTimer);
+        returnToPageTimer = setTimeout(() => {
+            returnToPageTimer = null;
+            if (document.hidden || !document.hasFocus()) return;
+            exitPiP();
+        }, delay);
+    }
+
+    function refreshVideoRendering(video) {
+        if (!video || video.isConnected === false) return;
+        const previousVisibility = video.style.visibility;
+        const previousTransform = video.style.transform;
+        video.style.visibility = 'hidden';
+        video.style.transform = 'translateZ(0)';
+        void video.offsetHeight;
+        requestAnimationFrame(() => {
+            if (!video.isConnected) return;
+            video.style.visibility = previousVisibility;
+            if (previousTransform) video.style.transform = previousTransform;
+            else video.style.removeProperty('transform');
+        });
     }
 
     async function exitPiP() {
@@ -330,19 +356,31 @@
 
     window.addEventListener('focus', () => {
         if (!CONFIG.enabled) return;
-        setTimeout(() => { if (document.hasFocus()) exitPiP(); }, 300);
+        scheduleReturnToPageExit(260);
     });
 
     document.addEventListener('visibilitychange', () => {
         if (!CONFIG.enabled) return;
         if (!document.hidden) {
-            log('info', '检测到页面恢复可见, 执行兜底退出检查...');
-            exitPiP(); // 比 focus 更可靠的恢复判定
+            log('info', '检测到页面恢复可见, 安排退出画中画...');
+            scheduleReturnToPageExit();
         }
     });
 
+    document.addEventListener('leavepictureinpicture', (event) => {
+        const video = event.target;
+        if (returnToPageTimer) {
+            clearTimeout(returnToPageTimer);
+            returnToPageTimer = null;
+        }
+        if (video instanceof HTMLVideoElement) {
+            refreshVideoRendering(video);
+            setTimeout(() => refreshVideoRendering(video), 120);
+        }
+    }, true);
+
     function init() {
-        log('info', `脚本已加载 v4.9.3 [${window.self === window.top ? 'Main' : 'Iframe'}]`);
+        log('info', `脚本已加载 v4.9.4 [${window.self === window.top ? 'Main' : 'Iframe'}]`);
         if (CONFIG.isMgtv) log('info', '检测到 MGTV, 已应用增强兼容性配置。');
         scanVideos();
         observer.observe(document.body, { childList: true, subtree: true });
