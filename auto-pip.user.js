@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频自动画中画
 // @namespace    http://tampermonkey.net/
-// @version      4.9.4
+// @version      4.9.7
 // @description  自动画中画，支持标签页切换、窗口失焦触发、回页自动退出，支持网页全屏
 // @author       mankaki
 // @match        *://*/*
@@ -23,6 +23,7 @@
     let iframeBlurPending = false; // 标记：是否刚点击了 iframe 等嵌入元素（可能导致假 blur）
     let webFullscreenSession = null;
     let returnToPageTimer = null;
+    let lastPipVideo = null;
 
     // 网页全屏样式注入
     const style = document.createElement('style');
@@ -47,6 +48,15 @@
             max-width: 100vw !important;
             max-height: 100vh !important;
             object-fit: contain !important;
+        }
+        .pip-web-fs-player {
+            position: fixed !important;
+            top: 0 !important;
+            left: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            z-index: 2147483647 !important;
+            background: #000 !important;
         }
         body.pip-web-fs-active {
             overflow: hidden !important;
@@ -87,17 +97,15 @@
     }
 
     function refreshVideoRendering(video) {
-        if (!video || video.isConnected === false) return;
-        const previousVisibility = video.style.visibility;
-        const previousTransform = video.style.transform;
-        video.style.visibility = 'hidden';
+        if (!video || !video.isConnected) return;
+        if (video.readyState >= 2) {
+            video.currentTime = video.currentTime;
+        }
         video.style.transform = 'translateZ(0)';
         void video.offsetHeight;
         requestAnimationFrame(() => {
             if (!video.isConnected) return;
-            video.style.visibility = previousVisibility;
-            if (previousTransform) video.style.transform = previousTransform;
-            else video.style.removeProperty('transform');
+            video.style.removeProperty('transform');
         });
     }
 
@@ -215,25 +223,47 @@
         if (target) await enterPiP(target, '快捷键 P');
     }
 
+    function findPlayerContainer(video) {
+        let el = video.parentElement;
+        let candidate = null;
+        while (el && el !== document.body) {
+            const id = (el.id || '').toLowerCase();
+            const cls = typeof el.className === 'string' ? el.className.toLowerCase() : '';
+            if (/player/.test(id) || /player/.test(cls)) candidate = el;
+            el = el.parentElement;
+        }
+        return candidate;
+    }
+
     function exitWebFullscreen() {
         if (!webFullscreenSession) return;
+        const { mode } = webFullscreenSession;
 
-        const { video, anchor, overlay, previousInlineStyle } = webFullscreenSession;
-        const fallbackParent = anchor?.parentNode || document.body;
-
-        if (anchor?.parentNode) {
-            anchor.parentNode.insertBefore(video, anchor);
-            anchor.remove();
-        } else if (overlay?.contains(video)) {
-            fallbackParent.appendChild(video);
+        if (mode === 'inplace') {
+            const { container, previousStyle, chain } = webFullscreenSession;
+            container.classList.remove('pip-web-fs-player');
+            if (previousStyle === null) container.removeAttribute('style');
+            else container.setAttribute('style', previousStyle);
+            chain.forEach(({ el, prev }) => {
+                if (prev === null) el.removeAttribute('style');
+                else el.setAttribute('style', prev);
+            });
+            window.dispatchEvent(new Event('resize'));
+        } else {
+            const { video, anchor, overlay, previousInlineStyle } = webFullscreenSession;
+            const fallbackParent = anchor?.parentNode || document.body;
+            if (anchor?.parentNode) {
+                anchor.parentNode.insertBefore(video, anchor);
+                anchor.remove();
+            } else if (overlay?.contains(video)) {
+                fallbackParent.appendChild(video);
+            }
+            overlay?.remove();
+            if (previousInlineStyle === null) video.removeAttribute('style');
+            else video.setAttribute('style', previousInlineStyle);
         }
 
-        overlay?.remove();
         document.body.classList.remove('pip-web-fs-active');
-
-        if (previousInlineStyle === null) video.removeAttribute('style');
-        else video.setAttribute('style', previousInlineStyle);
-
         webFullscreenSession = null;
         log('info', '退出网页全屏');
     }
@@ -250,26 +280,41 @@
         }
         if (webFullscreenSession) exitWebFullscreen();
 
-        const parent = video.parentNode;
-        if (!parent) return;
-
-        const anchor = document.createElement('div');
-        anchor.className = 'pip-web-fullscreen-anchor';
-        const overlay = document.createElement('div');
-        overlay.className = 'pip-web-fullscreen-container';
-        const previousInlineStyle = video.getAttribute('style');
-
-        parent.insertBefore(anchor, video);
-        overlay.appendChild(video);
-        document.body.appendChild(overlay);
+        const container = findPlayerContainer(video);
         document.body.classList.add('pip-web-fs-active');
-        video.style.removeProperty('max-width');
-        video.style.removeProperty('max-height');
-        video.style.removeProperty('width');
-        video.style.removeProperty('height');
 
-        webFullscreenSession = { video, anchor, overlay, previousInlineStyle };
-        log('info', '进入网页全屏, 目标: VIDEO');
+        if (container) {
+            const previousStyle = container.getAttribute('style');
+            container.classList.add('pip-web-fs-player');
+            const chain = [];
+            let el = video.parentElement;
+            while (el && el !== container) {
+                chain.push({ el, prev: el.getAttribute('style') });
+                el.style.setProperty('width', '100%', 'important');
+                el.style.setProperty('height', '100%', 'important');
+                el = el.parentElement;
+            }
+            window.dispatchEvent(new Event('resize'));
+            webFullscreenSession = { video, container, previousStyle, chain, mode: 'inplace' };
+            log('info', '进入网页全屏 (播放器容器模式)');
+        } else {
+            const parent = video.parentNode;
+            if (!parent) return;
+            const anchor = document.createElement('div');
+            anchor.className = 'pip-web-fullscreen-anchor';
+            const overlay = document.createElement('div');
+            overlay.className = 'pip-web-fullscreen-container';
+            const previousInlineStyle = video.getAttribute('style');
+            parent.insertBefore(anchor, video);
+            overlay.appendChild(video);
+            document.body.appendChild(overlay);
+            video.style.removeProperty('max-width');
+            video.style.removeProperty('max-height');
+            video.style.removeProperty('width');
+            video.style.removeProperty('height');
+            webFullscreenSession = { video, anchor, overlay, previousInlineStyle, mode: 'overlay' };
+            log('info', '进入网页全屏 (覆盖层模式)');
+        }
     }
 
     document.addEventListener('keydown', (e) => {
@@ -356,12 +401,22 @@
 
     window.addEventListener('focus', () => {
         if (!CONFIG.enabled) return;
+        if (lastPipVideo && lastPipVideo.isConnected) {
+            refreshVideoRendering(lastPipVideo);
+            setTimeout(() => refreshVideoRendering(lastPipVideo), 120);
+            lastPipVideo = null;
+        }
         scheduleReturnToPageExit(260);
     });
 
     document.addEventListener('visibilitychange', () => {
         if (!CONFIG.enabled) return;
         if (!document.hidden) {
+            if (lastPipVideo && lastPipVideo.isConnected) {
+                refreshVideoRendering(lastPipVideo);
+                setTimeout(() => refreshVideoRendering(lastPipVideo), 120);
+                lastPipVideo = null;
+            }
             log('info', '检测到页面恢复可见, 安排退出画中画...');
             scheduleReturnToPageExit();
         }
@@ -369,6 +424,7 @@
 
     document.addEventListener('leavepictureinpicture', (event) => {
         const video = event.target;
+        lastPipVideo = video;
         if (returnToPageTimer) {
             clearTimeout(returnToPageTimer);
             returnToPageTimer = null;
@@ -380,7 +436,7 @@
     }, true);
 
     function init() {
-        log('info', `脚本已加载 v4.9.4 [${window.self === window.top ? 'Main' : 'Iframe'}]`);
+        log('info', `脚本已加载 v4.9.7 [${window.self === window.top ? 'Main' : 'Iframe'}]`);
         if (CONFIG.isMgtv) log('info', '检测到 MGTV, 已应用增强兼容性配置。');
         scanVideos();
         observer.observe(document.body, { childList: true, subtree: true });
