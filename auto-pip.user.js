@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频自动画中画
 // @namespace    http://tampermonkey.net/
-// @version      4.9.7
+// @version      4.13.8
 // @description  自动画中画，支持标签页切换、窗口失焦触发、回页自动退出，支持网页全屏
 // @author       mankaki
 // @match        *://*/*
@@ -13,10 +13,28 @@
 (function () {
     'use strict';
 
+    const HOSTNAME = location.hostname;
+    const isAliyunDrive = HOSTNAME.includes('aliyundrive.com');
+
     const CONFIG = {
         enabled: true,
-        debug: true,
-        isMgtv: location.hostname.includes('mgtv.com')
+        debug: false,
+        // 原生自动 PiP 在部分 Chromium/站点中被脚本关闭后，下一轮自动进入会要求重新点击页面。
+        // auto-close: 回页自动关闭 PiP，但这类站点可能需要再次点击页面才会触发下一轮自动 PiP。
+        // continuous: 不自动关闭原生自动 PiP，优先保证反复切 tab 都能继续自动进入。
+        nativeAutoPiPReturnMode: 'auto-close',
+        nativeAutoPiPFallbackExitDelay: 600,
+        refreshVideoOnReturn: !isAliyunDrive,
+        lightweightVideoScan: isAliyunDrive,
+        stopDynamicObserverAfterFirstVideo: isAliyunDrive,
+        conservativePiPRearm: isAliyunDrive,
+        minimalMode: false,
+        deferAutoPiPAttributeUntilHidden: false,
+        setAutoPiPBeforePlaybackOnly: isAliyunDrive,
+        autoPiPStablePlaybackDelay: isAliyunDrive ? 3000 : 0,
+        hookVideoCreation: false,
+        shortcutsOnlyMode: isAliyunDrive,
+        isMgtv: HOSTNAME.includes('mgtv.com')
     };
 
     let hasEverInteracted = false;
@@ -24,8 +42,14 @@
     let webFullscreenSession = null;
     let returnToPageTimer = null;
     let lastPipVideo = null;
+    let nativeAutoPiPVideo = null;
+    let nativeAutoPiPFallbackExitTimer = null;
+    let dynamicObserverStopped = false;
+    const observedVideos = new Set();
+    let webFullscreenStyleInjected = false;
 
-    // 网页全屏样式注入
+    installVideoCreationHook();
+
     const style = document.createElement('style');
     style.textContent = `
         .pip-web-fullscreen-container {
@@ -65,7 +89,11 @@
             display: none !important;
         }
     `;
-    document.head.appendChild(style);
+    function ensureWebFullscreenStyle() {
+        if (webFullscreenStyleInjected) return;
+        webFullscreenStyleInjected = true;
+        (document.head || document.documentElement)?.appendChild(style);
+    }
 
     function log(type, ...args) {
         if (!CONFIG.debug) return;
@@ -73,6 +101,28 @@
         if (type === 'warn') console.warn(prefix, ...args);
         else if (type === 'error') console.error(prefix, ...args);
         else console.log(prefix, ...args);
+    }
+
+    function markVideoForNativeAutoPiP(video) {
+        if (!video || !video.isConnected && video.ownerDocument !== document) return;
+        video.removeAttribute('disablepictureinpicture');
+        video.setAttribute('autopictureinpicture', '');
+        if (typeof video.autoPictureInPicture !== 'undefined' && video.autoPictureInPicture !== true) {
+            video.autoPictureInPicture = true;
+        }
+    }
+
+    function installVideoCreationHook() {
+        if (!CONFIG.hookVideoCreation || document.__pipCreateElementHooked) return;
+        document.__pipCreateElementHooked = true;
+        const originalCreateElement = document.createElement.bind(document);
+        document.createElement = function (tagName, options) {
+            const element = originalCreateElement(tagName, options);
+            if (String(tagName).toLowerCase() === 'video') {
+                markVideoForNativeAutoPiP(element);
+            }
+            return element;
+        };
     }
 
     let lastActionTime = 0;
@@ -92,11 +142,35 @@
         returnToPageTimer = setTimeout(() => {
             returnToPageTimer = null;
             if (document.hidden || !document.hasFocus()) return;
+            if (nativeAutoPiPVideo && document.pictureInPictureElement === nativeAutoPiPVideo) {
+                if (CONFIG.nativeAutoPiPReturnMode === 'continuous') {
+                    log('debug', '检测到原生自动画中画会话，连续模式下保持 PiP 打开');
+                    return;
+                }
+                scheduleNativeAutoPiPFallbackExit();
+                return;
+            }
             exitPiP();
         }, delay);
     }
 
+    function scheduleNativeAutoPiPFallbackExit(delay = CONFIG.nativeAutoPiPFallbackExitDelay) {
+        if (nativeAutoPiPFallbackExitTimer) clearTimeout(nativeAutoPiPFallbackExitTimer);
+        log('debug', `检测到原生自动画中画会话，等待浏览器自动退出，delay=${delay}ms`);
+        nativeAutoPiPFallbackExitTimer = setTimeout(() => {
+            nativeAutoPiPFallbackExitTimer = null;
+            if (!CONFIG.enabled || document.hidden || !document.hasFocus()) return;
+            if (nativeAutoPiPVideo && document.pictureInPictureElement === nativeAutoPiPVideo) {
+                log('debug', '浏览器未自动退出原生画中画，执行延迟兜底退出');
+                nativeAutoPiPVideo = null;
+                exitPiP();
+                scheduleNativeAutoPiPRearm('原生画中画兜底退出后');
+            }
+        }, delay);
+    }
+
     function refreshVideoRendering(video) {
+        if (!CONFIG.refreshVideoOnReturn) return;
         if (!video || !video.isConnected) return;
         if (video.readyState >= 2) {
             video.currentTime = video.currentTime;
@@ -181,20 +255,75 @@
     function applyPipConfig(video) {
         if (video.dataset.pipObserved) return;
         video.dataset.pipObserved = 'true';
+        observedVideos.add(video);
 
-        // 属性强效守护：确保 autoPictureInPicture 始终启用
-        const enforceNative = () => {
-            if (video.autoPictureInPicture !== true) {
-                video.autoPictureInPicture = true;
-                log('debug', '重新锁定原生自动画中画属性');
+        if (!CONFIG.setAutoPiPBeforePlaybackOnly || video.paused || video.readyState < 2) {
+            enforceNativeAutoPiP(video);
+        }
+        if (CONFIG.conservativePiPRearm) {
+            const finalizePlayableVideo = () => {
+                scheduleStableAutoPiP(video);
+                stopDynamicObserverIfNeeded();
+            };
+            video.addEventListener('loadedmetadata', () => {
+                if (video.paused || video.readyState < 2) enforceNativeAutoPiP(video);
+            }, { once: true });
+            video.addEventListener('play', finalizePlayableVideo, { once: true });
+            video.addEventListener('playing', finalizePlayableVideo, { once: true });
+            if (!video.paused || video.readyState >= 2) {
+                scheduleStableAutoPiP(video);
+                stopDynamicObserverIfNeeded();
             }
-        };
-
-        enforceNative();
-        video.addEventListener('play', enforceNative);
-        video.addEventListener('playing', enforceNative);
+        } else {
+            video.addEventListener('play', () => enforceNativeAutoPiP(video));
+            video.addEventListener('playing', () => enforceNativeAutoPiP(video));
+        }
 
         log('info', '检测到有效播放器, 已应用配置');
+    }
+
+    // 属性强效守护：确保 autoPictureInPicture 始终启用。
+    // 部分站点/Chromium 在退出原生自动 PiP 后会把状态掉回去，需要在下一次切页前重新锁定。
+    function enforceNativeAutoPiP(video) {
+        if (!video || !video.isConnected) return;
+        markVideoForNativeAutoPiP(video);
+        if (typeof video.autoPictureInPicture !== 'undefined') {
+            log('debug', '重新锁定原生自动画中画属性');
+        }
+    }
+
+    function scheduleStableAutoPiP(video) {
+        if (!CONFIG.autoPiPStablePlaybackDelay || video.dataset.pipStableScheduled) return;
+        video.dataset.pipStableScheduled = 'true';
+        setTimeout(() => {
+            if (!CONFIG.enabled || !video.isConnected || video.paused || video.seeking || video.readyState < 2) {
+                video.dataset.pipStableScheduled = '';
+                return;
+            }
+            enforceNativeAutoPiP(video);
+        }, CONFIG.autoPiPStablePlaybackDelay);
+    }
+
+    function enforceAllNativeAutoPiP() {
+        observedVideos.forEach(video => {
+            if (!video.isConnected) {
+                observedVideos.delete(video);
+                return;
+            }
+            enforceNativeAutoPiP(video);
+        });
+    }
+
+    function scheduleNativeAutoPiPRearm(reason) {
+        if (CONFIG.conservativePiPRearm) return;
+        enforceAllNativeAutoPiP();
+        [120, 500, 1200].forEach(delay => {
+            setTimeout(() => {
+                if (!CONFIG.enabled) return;
+                enforceAllNativeAutoPiP();
+                log('debug', `延迟重锁原生自动画中画: ${reason}, delay=${delay}ms`);
+            }, delay);
+        });
     }
 
     function setupVideo(video) {
@@ -209,7 +338,21 @@
     }
 
     function scanVideos() {
-        findVideosDeep().forEach(setupVideo);
+        const videos = CONFIG.lightweightVideoScan ? Array.from(document.querySelectorAll('video')) : findVideosDeep();
+        videos.forEach(setupVideo);
+    }
+
+    function stopDynamicObserverIfNeeded() {
+        if (!CONFIG.stopDynamicObserverAfterFirstVideo || dynamicObserverStopped) return;
+        const hasPlayableVideo = Array.from(observedVideos).some(video => video.isConnected && (!video.paused || video.readyState >= 2));
+        if (!hasPlayableVideo) return;
+        dynamicObserverStopped = true;
+        if (scanTimeout) {
+            clearTimeout(scanTimeout);
+            scanTimeout = null;
+        }
+        observer.disconnect();
+        log('debug', '检测到可播放视频，已停止动态 DOM 观察以降低播放器页面开销');
     }
 
     async function toggleManualPiP() {
@@ -229,7 +372,22 @@
         while (el && el !== document.body) {
             const id = (el.id || '').toLowerCase();
             const cls = typeof el.className === 'string' ? el.className.toLowerCase() : '';
-            if (/player/.test(id) || /player/.test(cls)) candidate = el;
+            const hasPlayerName = /player|video|preview|viewer|media/.test(id) || /player|video|preview|viewer|media/.test(cls);
+            const hasControlBar = !!el.querySelector([
+                '.bpx-player-control-wrap',
+                '.bpx-player-control-bottom',
+                '.bilibili-player-video-control',
+                '[class*="control" i]',
+                '[class*="controller" i]',
+                '[class*="progress" i]',
+                '[class*="toolbar" i]',
+                '[class*="slider" i]',
+                'input[type="range"]'
+            ].join(','));
+            const rect = el.getBoundingClientRect();
+            const looksLikePlayerShell = rect.width >= video.offsetWidth && rect.height >= video.offsetHeight && hasControlBar;
+            if (looksLikePlayerShell) return el;
+            if (!candidate && hasPlayerName) candidate = el;
             el = el.parentElement;
         }
         return candidate;
@@ -244,6 +402,26 @@
             container.classList.remove('pip-web-fs-player');
             if (previousStyle === null) container.removeAttribute('style');
             else container.setAttribute('style', previousStyle);
+            chain.forEach(({ el, prev }) => {
+                if (prev === null) el.removeAttribute('style');
+                else el.setAttribute('style', prev);
+            });
+            window.dispatchEvent(new Event('resize'));
+        } else if (mode === 'container-overlay') {
+            const { video, container, anchor, overlay, previousStyle, previousVideoStyle, chain } = webFullscreenSession;
+            const fallbackParent = anchor?.parentNode || document.body;
+            container.classList.remove('pip-web-fs-player');
+            if (anchor?.parentNode) {
+                anchor.parentNode.insertBefore(container, anchor);
+                anchor.remove();
+            } else if (overlay?.contains(container)) {
+                fallbackParent.appendChild(container);
+            }
+            overlay?.remove();
+            if (previousStyle === null) container.removeAttribute('style');
+            else container.setAttribute('style', previousStyle);
+            if (previousVideoStyle === null) video.removeAttribute('style');
+            else video.setAttribute('style', previousVideoStyle);
             chain.forEach(({ el, prev }) => {
                 if (prev === null) el.removeAttribute('style');
                 else el.setAttribute('style', prev);
@@ -268,35 +446,57 @@
         log('info', '退出网页全屏');
     }
 
+    function buildFullscreenChain(video, container) {
+        const chain = [];
+        let el = video.parentElement;
+        while (el && el !== container) {
+            chain.push({ el, prev: el.getAttribute('style') });
+            el.style.setProperty('width', '100%', 'important');
+            el.style.setProperty('height', '100%', 'important');
+            el.style.setProperty('max-width', '100vw', 'important');
+            el.style.setProperty('max-height', '100vh', 'important');
+            el = el.parentElement;
+        }
+        return chain;
+    }
+
     function toggleWebFullscreen() {
+        ensureWebFullscreenStyle();
         const allVideos = findVideosDeep().filter(v => v.readyState >= 2);
         if (allVideos.length === 0) return;
         let video = allVideos.find(v => !v.paused) || allVideos[0];
         if (!video) return;
 
+        const container = findPlayerContainer(video);
         if (webFullscreenSession?.video === video) {
             exitWebFullscreen();
             return;
         }
         if (webFullscreenSession) exitWebFullscreen();
 
-        const container = findPlayerContainer(video);
         document.body.classList.add('pip-web-fs-active');
 
         if (container) {
             const previousStyle = container.getAttribute('style');
+            const previousVideoStyle = video.getAttribute('style');
+            const parent = container.parentNode;
+            if (!parent) return;
+            const anchor = document.createElement('div');
+            anchor.className = 'pip-web-fullscreen-anchor';
+            const overlay = document.createElement('div');
+            overlay.className = 'pip-web-fullscreen-container';
+            const chain = buildFullscreenChain(video, container);
+            parent.insertBefore(anchor, container);
             container.classList.add('pip-web-fs-player');
-            const chain = [];
-            let el = video.parentElement;
-            while (el && el !== container) {
-                chain.push({ el, prev: el.getAttribute('style') });
-                el.style.setProperty('width', '100%', 'important');
-                el.style.setProperty('height', '100%', 'important');
-                el = el.parentElement;
-            }
+            overlay.appendChild(container);
+            document.body.appendChild(overlay);
+            video.style.setProperty('width', '100%', 'important');
+            video.style.setProperty('height', '100%', 'important');
+            video.style.setProperty('max-width', '100vw', 'important');
+            video.style.setProperty('max-height', '100vh', 'important');
             window.dispatchEvent(new Event('resize'));
-            webFullscreenSession = { video, container, previousStyle, chain, mode: 'inplace' };
-            log('info', '进入网页全屏 (播放器容器模式)');
+            webFullscreenSession = { video, container, anchor, overlay, previousStyle, previousVideoStyle, chain, mode: 'container-overlay' };
+            log('info', '进入网页全屏 (播放器容器覆盖层模式)');
         } else {
             const parent = video.parentNode;
             if (!parent) return;
@@ -317,8 +517,42 @@
         }
     }
 
+    function isEditableTarget(event) {
+        const target = event.target;
+        const editableSelector = [
+            'input',
+            'textarea',
+            '[contenteditable=""]',
+            '[contenteditable="true"]',
+            '[role="textbox"]',
+            'bili-comment-rich-textarea',
+            '.ql-editor',
+            '.reply-box-textarea',
+            '.bili-rich-textarea',
+            '.brt-editor',
+            '.brt-root'
+        ].join(',');
+        const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+        const isBiliCommentEditor = node => node instanceof Element
+            && node.matches('#editor.active')
+            && !!node.querySelector?.('bili-comment-rich-textarea');
+        const closestBiliCommentEditor = node => {
+            const editor = node instanceof Element ? node.closest('#editor.active') : null;
+            return !!editor?.querySelector?.('bili-comment-rich-textarea');
+        };
+        if (path.some(isBiliCommentEditor)) return true;
+        if (path.some(node => node instanceof Element && (node.matches(editableSelector) || node.isContentEditable))) return true;
+        if (!(target instanceof Element)) return false;
+        const active = document.activeElement;
+        return !!target.closest(editableSelector)
+            || closestBiliCommentEditor(target)
+            || !!active?.closest?.(editableSelector)
+            || closestBiliCommentEditor(active);
+    }
+
     document.addEventListener('keydown', (e) => {
-        if (['INPUT', 'TEXTAREA'].includes(e.target.tagName) || e.target.isContentEditable) return;
+        if (CONFIG.minimalMode) return;
+        if (isEditableTarget(e)) return;
         const key = e.key.toLowerCase();
 
         // 支持按 ESC 退出网页全屏
@@ -338,12 +572,13 @@
 
     let scanTimeout = null;
     const observer = new MutationObserver(mutations => {
+        if (dynamicObserverStopped) return;
         let hasPotentialNodes = false;
         mutations.forEach(m => m.addedNodes.forEach(node => {
             if (node.nodeType !== Node.ELEMENT_NODE) return;
             if (node.tagName === 'VIDEO') {
                 setupVideo(node);
-            } else {
+            } else if (node.shadowRoot || node.querySelector?.('video')) {
                 hasPotentialNodes = true;
             }
         }));
@@ -353,13 +588,15 @@
         if (hasPotentialNodes) {
             if (scanTimeout) clearTimeout(scanTimeout);
             scanTimeout = setTimeout(() => {
-                scanVideos(); // 重复检测有防重入机制，所以直接全局重扫代价反而比遍历几十次 subtree 要小得多
+                scanVideos(); // 仅在新增节点可能含视频时全局重扫，避免播放器控件高频 DOM 更新拖慢播放
                 scanTimeout = null;
             }, 800);
         }
     });
 
     window.addEventListener('blur', () => {
+        if (CONFIG.shortcutsOnlyMode) return;
+        if (CONFIG.minimalMode) return;
         const activation = getActivationState();
         log('info', `>>> blur 触发! enabled=${CONFIG.enabled}, pipEl=${!!document.pictureInPictureElement}, hidden=${document.hidden}, hasFocus=${document.hasFocus()}, activeEl=${document.activeElement?.tagName}, iframePending=${iframeBlurPending}, activation=${activation.isActive}/${activation.hasBeenActive}, everInteracted=${hasEverInteracted}`);
 
@@ -400,7 +637,10 @@
     });
 
     window.addEventListener('focus', () => {
+        if (CONFIG.shortcutsOnlyMode) return;
+        if (CONFIG.minimalMode) return;
         if (!CONFIG.enabled) return;
+        if (!CONFIG.conservativePiPRearm) scheduleNativeAutoPiPRearm('页面重新聚焦');
         if (lastPipVideo && lastPipVideo.isConnected) {
             refreshVideoRendering(lastPipVideo);
             setTimeout(() => refreshVideoRendering(lastPipVideo), 120);
@@ -410,7 +650,12 @@
     });
 
     document.addEventListener('visibilitychange', () => {
+        if (CONFIG.shortcutsOnlyMode) return;
+        if (CONFIG.minimalMode) {
+            return;
+        }
         if (!CONFIG.enabled) return;
+        if (!CONFIG.conservativePiPRearm) scheduleNativeAutoPiPRearm(document.hidden ? '页面隐藏' : '页面恢复可见');
         if (!document.hidden) {
             if (lastPipVideo && lastPipVideo.isConnected) {
                 refreshVideoRendering(lastPipVideo);
@@ -423,36 +668,62 @@
     });
 
     document.addEventListener('leavepictureinpicture', (event) => {
+        if (CONFIG.shortcutsOnlyMode) return;
+        if (CONFIG.minimalMode) return;
         const video = event.target;
+        const wasNativeAutoPiP = nativeAutoPiPVideo === video;
+        if (wasNativeAutoPiP) nativeAutoPiPVideo = null;
+        if (nativeAutoPiPFallbackExitTimer) {
+            clearTimeout(nativeAutoPiPFallbackExitTimer);
+            nativeAutoPiPFallbackExitTimer = null;
+        }
         lastPipVideo = video;
         if (returnToPageTimer) {
             clearTimeout(returnToPageTimer);
             returnToPageTimer = null;
         }
         if (video instanceof HTMLVideoElement) {
+            if (!CONFIG.conservativePiPRearm) {
+                enforceNativeAutoPiP(video);
+                scheduleNativeAutoPiPRearm('退出画中画');
+            }
             refreshVideoRendering(video);
             setTimeout(() => refreshVideoRendering(video), 120);
         }
     }, true);
 
-    function init() {
-        log('info', `脚本已加载 v4.9.7 [${window.self === window.top ? 'Main' : 'Iframe'}]`);
-        if (CONFIG.isMgtv) log('info', '检测到 MGTV, 已应用增强兼容性配置。');
-        scanVideos();
-        observer.observe(document.body, { childList: true, subtree: true });
+    document.addEventListener('enterpictureinpicture', (event) => {
+        if (CONFIG.shortcutsOnlyMode) return;
+        if (CONFIG.minimalMode) return;
+        const video = event.target;
+        if (video instanceof HTMLVideoElement && document.hidden) {
+            nativeAutoPiPVideo = video;
+            log('debug', '记录到原生自动画中画会话');
+        }
+    }, true);
 
-        // 支持触控设备，涵盖鼠标与触摸(iPad等)
-        document.addEventListener('pointerdown', (e) => {
-            hasEverInteracted = true;
-            // 点击 iframe/embed/object 可能导致窗口 blur，设置标记以忽略该次 blur
-            if (e.target && (e.target.tagName === 'IFRAME' || e.target.tagName === 'EMBED' || e.target.tagName === 'OBJECT')) {
-                iframeBlurPending = true;
-                setTimeout(() => { iframeBlurPending = false; }, 500);
-                log('info', `记录到页面交互（iframe/嵌入元素点击），activation=${getActivationState().isActive}/${getActivationState().hasBeenActive}`);
-            } else {
-                log('info', `记录到页面交互，activation=${getActivationState().isActive}/${getActivationState().hasBeenActive}`);
-            }
-        }, true);
+    function init() {
+        log('info', `脚本已加载 v4.13.8 [${window.self === window.top ? 'Main' : 'Iframe'}]`);
+        if (CONFIG.isMgtv) log('info', '检测到 MGTV, 已应用增强兼容性配置。');
+        if (!CONFIG.shortcutsOnlyMode) {
+            scanVideos();
+            if (!dynamicObserverStopped) observer.observe(document.body, { childList: true, subtree: true });
+        }
+
+        if (!CONFIG.shortcutsOnlyMode && !CONFIG.minimalMode) {
+            // 支持触控设备，涵盖鼠标与触摸(iPad等)
+            document.addEventListener('pointerdown', (e) => {
+                hasEverInteracted = true;
+                // 点击 iframe/embed/object 可能导致窗口 blur，设置标记以忽略该次 blur
+                if (e.target && (e.target.tagName === 'IFRAME' || e.target.tagName === 'EMBED' || e.target.tagName === 'OBJECT')) {
+                    iframeBlurPending = true;
+                    setTimeout(() => { iframeBlurPending = false; }, 500);
+                    log('info', `记录到页面交互（iframe/嵌入元素点击），activation=${getActivationState().isActive}/${getActivationState().hasBeenActive}`);
+                } else {
+                    log('info', `记录到页面交互，activation=${getActivationState().isActive}/${getActivationState().hasBeenActive}`);
+                }
+            }, true);
+        }
     }
 
     if (document.readyState === 'loading') {

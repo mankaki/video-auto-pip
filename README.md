@@ -24,7 +24,10 @@
 ```javascript
 const CONFIG = {
     enabled: true,  // 是否启用
-    debug: true     // 是否在控制台输出运行日志
+    debug: false,   // 是否在控制台输出运行日志
+    nativeAutoPiPReturnMode: 'auto-close', // 原生自动 PiP 回页策略：auto-close 或 continuous
+    nativeAutoPiPFallbackExitDelay: 600,   // auto-close 模式下等待浏览器自动退出的兜底延迟
+    refreshVideoOnReturn: !isAliyunDrive   // 回页/退出 PiP 后是否主动刷新视频渲染层；阿里云盘默认关闭以减少卡顿
 };
 ```
 
@@ -50,6 +53,7 @@ const CONFIG = {
 3. 如果没有自动弹出，请手动全选复制页面代码，并在 Tampermonkey 中新建脚本粘贴保存。
 
 ## 📜 版本记录
+*   **v4.13.8**: 收敛近期兼容性调整：阿里云盘进入快捷键-only 模式以降低播放卡顿并保留 `P`/`Q`；`Q` 网页全屏改用播放器容器覆盖层以保留控件；B 站评论框和常见富文本输入区输入 `p`/`q` 时不再误触发快捷键。
 *   **v4.9.4**: 修复切回视频页后画中画退出但画面黑屏、只剩声音的问题。回页退出改为去抖调度避免抢跑，并在 `leavepictureinpicture` 后主动刷新视频渲染层。
 *   **v4.9.3**: 修正手势模型说明与日志。改为基于真实 `navigator.userActivation` 判断是否可调用 `requestPictureInPicture()`，避免把“曾经点击过页面”误判为可长期复用的授权；补充 Chromium 在“切到别的应用”场景下的限制提示。
 *   **v4.8.3**: 骨灰级性能与鲁棒性调优。重构 ResizeObserver 为单一实例避免内存泄漏；引入防抖机制控制 MutationObserver 防止大规模 DOM 变动时的帧率掉底；修复点击页面 iframe 误触画中画；添加返回原页兜底退出、ESC 退出网页全屏及所有触屏手势响应的支持。
