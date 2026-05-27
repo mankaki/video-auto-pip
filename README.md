@@ -9,13 +9,13 @@
 *   **⌨️ 快捷键支持**：
     *   `P` 键：手动开启或关闭画中画（支持播放/暂停视频）。
     *   `Q` 键：切换**网页全屏**（视频铺满浏览器窗口）。
-*   **🛡️ 运行稳定**：优先依赖 `autoPictureInPicture` 原生能力处理标签切换，同时对手动 PiP、回页退出和动态播放器做兼容增强。
+*   **🛡️ 运行稳定**：优先依赖浏览器自动 PiP 能力处理标签切换，并注册 Media Session 自动 PiP 处理器，同时对手动 PiP、回页退出和动态播放器做兼容增强。
 
 ## 💡 使用技巧（必读）
 
 由于浏览器的安全限制，`requestPictureInPicture()` 需要**调用当下仍然有效的瞬时用户激活**。
 *   `P` 键属于用户主动操作，适合手动开启/关闭 PiP。
-*   标签切换主要依赖原生 `autoPictureInPicture`。
+*   标签切换主要依赖浏览器自动 PiP；Chrome 134+ 需要站点或脚本注册 `enterpictureinpicture` Media Session 处理器。
 *   “先点一次页面，再切到别的应用自动入 PiP” 在 Chromium 中不可靠。
 
 ## 🛠 配置说明
@@ -53,6 +53,9 @@ const CONFIG = {
 3. 如果没有自动弹出，请手动全选复制页面代码，并在 Tampermonkey 中新建脚本粘贴保存。
 
 ## 📜 版本记录
+*   **v4.13.11**: 将脚本提前到 `document-start` 注入以尽早 hook Media Session；页面设置或清空 `enterpictureinpicture` handler 都视为页面接管，避免覆盖站点自己的 PiP 策略。
+*   **v4.13.10**: 包装 `navigator.mediaSession.setActionHandler`，当页面后续接管 `enterpictureinpicture` 时不再反复覆盖，并修复脚本 handler 被页面清除后状态标记失真的问题。
+*   **v4.13.9**: 注册 `navigator.mediaSession.setActionHandler('enterpictureinpicture', ...)`，修复部分 Chromium 中第一次切换标签页也不会自动进入画中画的问题。
 *   **v4.13.8**: 收敛近期兼容性调整：阿里云盘进入快捷键-only 模式以降低播放卡顿并保留 `P`/`Q`；`Q` 网页全屏改用播放器容器覆盖层以保留控件；B 站评论框和常见富文本输入区输入 `p`/`q` 时不再误触发快捷键。
 *   **v4.9.4**: 修复切回视频页后画中画退出但画面黑屏、只剩声音的问题。回页退出改为去抖调度避免抢跑，并在 `leavepictureinpicture` 后主动刷新视频渲染层。
 *   **v4.9.3**: 修正手势模型说明与日志。改为基于真实 `navigator.userActivation` 判断是否可调用 `requestPictureInPicture()`，避免把“曾经点击过页面”误判为可长期复用的授权；补充 Chromium 在“切到别的应用”场景下的限制提示。

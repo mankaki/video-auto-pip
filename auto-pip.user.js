@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         视频自动画中画
 // @namespace    http://tampermonkey.net/
-// @version      4.13.8
+// @version      4.13.11
 // @description  自动画中画，支持标签页切换、窗口失焦触发、回页自动退出，支持网页全屏
 // @author       mankaki
 // @match        *://*/*
 // @grant        none
-// @run-at       document-idle
+// @run-at       document-start
 // @allFrames    true
 // ==/UserScript==
 
@@ -45,6 +45,10 @@
     let nativeAutoPiPVideo = null;
     let nativeAutoPiPFallbackExitTimer = null;
     let dynamicObserverStopped = false;
+    let mediaSessionAutoPiPHandler = null;
+    let mediaSessionAutoPiPHandlerInstalled = false;
+    let mediaSessionAutoPiPOverriddenByPage = false;
+    let mediaSessionSetActionHandlerHooked = false;
     const observedVideos = new Set();
     let webFullscreenStyleInjected = false;
 
@@ -260,8 +264,10 @@
         if (!CONFIG.setAutoPiPBeforePlaybackOnly || video.paused || video.readyState < 2) {
             enforceNativeAutoPiP(video);
         }
+        installMediaSessionAutoPiPHandler();
         if (CONFIG.conservativePiPRearm) {
             const finalizePlayableVideo = () => {
+                installMediaSessionAutoPiPHandler();
                 scheduleStableAutoPiP(video);
                 stopDynamicObserverIfNeeded();
             };
@@ -275,8 +281,14 @@
                 stopDynamicObserverIfNeeded();
             }
         } else {
-            video.addEventListener('play', () => enforceNativeAutoPiP(video));
-            video.addEventListener('playing', () => enforceNativeAutoPiP(video));
+            video.addEventListener('play', () => {
+                enforceNativeAutoPiP(video);
+                installMediaSessionAutoPiPHandler();
+            });
+            video.addEventListener('playing', () => {
+                enforceNativeAutoPiP(video);
+                installMediaSessionAutoPiPHandler();
+            });
         }
 
         log('info', '检测到有效播放器, 已应用配置');
@@ -317,13 +329,78 @@
     function scheduleNativeAutoPiPRearm(reason) {
         if (CONFIG.conservativePiPRearm) return;
         enforceAllNativeAutoPiP();
+        installMediaSessionAutoPiPHandler();
         [120, 500, 1200].forEach(delay => {
             setTimeout(() => {
                 if (!CONFIG.enabled) return;
                 enforceAllNativeAutoPiP();
+                installMediaSessionAutoPiPHandler();
                 log('debug', `延迟重锁原生自动画中画: ${reason}, delay=${delay}ms`);
             }, delay);
         });
+    }
+
+    function getBestAutoPiPVideo() {
+        const isUsable = video =>
+            video.isConnected
+            && !video.paused
+            && !video.muted
+            && video.readyState >= 2
+            && video.disablePictureInPicture !== true;
+        const observed = Array.from(observedVideos).filter(isUsable);
+        return observed[0] || findVideosDeep().find(isUsable);
+    }
+
+    function createMediaSessionAutoPiPHandler() {
+        if (mediaSessionAutoPiPHandler) return mediaSessionAutoPiPHandler;
+        mediaSessionAutoPiPHandler = async () => {
+            if (!CONFIG.enabled || document.pictureInPictureElement) return;
+            const video = getBestAutoPiPVideo();
+            if (!video) {
+                log('debug', '浏览器请求自动画中画，但未找到可用播放视频');
+                return;
+            }
+            try {
+                enforceNativeAutoPiP(video);
+                await video.requestPictureInPicture();
+                log('info', '成功响应浏览器自动画中画请求');
+            } catch (err) {
+                log('warn', `响应浏览器自动画中画请求失败: ${err.name}: ${err.message}`);
+            }
+        };
+        return mediaSessionAutoPiPHandler;
+    }
+
+    function hookMediaSessionSetActionHandler() {
+        if (mediaSessionSetActionHandlerHooked) return;
+        if (!('mediaSession' in navigator) || typeof navigator.mediaSession.setActionHandler !== 'function') return;
+        const originalSetActionHandler = navigator.mediaSession.setActionHandler.bind(navigator.mediaSession);
+        navigator.mediaSession.setActionHandler = (action, handler) => {
+            const result = originalSetActionHandler(action, handler);
+            if (action === 'enterpictureinpicture') {
+                const ownHandler = createMediaSessionAutoPiPHandler();
+                if (handler !== ownHandler) {
+                    mediaSessionAutoPiPHandlerInstalled = false;
+                    mediaSessionAutoPiPOverriddenByPage = true;
+                    log('debug', handler ? '页面已接管 Media Session 自动画中画处理器' : '页面清除了 Media Session 自动画中画处理器');
+                }
+            }
+            return result;
+        };
+        mediaSessionSetActionHandlerHooked = true;
+    }
+
+    function installMediaSessionAutoPiPHandler() {
+        if (!('mediaSession' in navigator) || typeof navigator.mediaSession.setActionHandler !== 'function') return;
+        hookMediaSessionSetActionHandler();
+        if (mediaSessionAutoPiPHandlerInstalled || mediaSessionAutoPiPOverriddenByPage) return;
+        try {
+            navigator.mediaSession.setActionHandler('enterpictureinpicture', createMediaSessionAutoPiPHandler());
+            mediaSessionAutoPiPHandlerInstalled = true;
+            log('debug', '已注册 Media Session 自动画中画处理器');
+        } catch (err) {
+            log('warn', `当前浏览器不支持 Media Session 自动画中画处理器: ${err.name}: ${err.message}`);
+        }
     }
 
     function setupVideo(video) {
@@ -703,9 +780,10 @@
     }, true);
 
     function init() {
-        log('info', `脚本已加载 v4.13.8 [${window.self === window.top ? 'Main' : 'Iframe'}]`);
+        log('info', `脚本已加载 v4.13.11 [${window.self === window.top ? 'Main' : 'Iframe'}]`);
         if (CONFIG.isMgtv) log('info', '检测到 MGTV, 已应用增强兼容性配置。');
         if (!CONFIG.shortcutsOnlyMode) {
+            installMediaSessionAutoPiPHandler();
             scanVideos();
             if (!dynamicObserverStopped) observer.observe(document.body, { childList: true, subtree: true });
         }
@@ -724,6 +802,10 @@
                 }
             }, true);
         }
+    }
+
+    if (!CONFIG.shortcutsOnlyMode) {
+        hookMediaSessionSetActionHandler();
     }
 
     if (document.readyState === 'loading') {
