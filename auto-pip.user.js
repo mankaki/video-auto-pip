@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频自动画中画
 // @namespace    http://tampermonkey.net/
-// @version      4.13.11
+// @version      4.13.12
 // @description  自动画中画，支持标签页切换、窗口失焦触发、回页自动退出，支持网页全屏
 // @author       mankaki
 // @match        *://*/*
@@ -76,6 +76,17 @@
             max-width: 100vw !important;
             max-height: 100vh !important;
             object-fit: contain !important;
+        }
+        .pip-web-fullscreen-container:fullscreen,
+        .pip-web-fs-player:fullscreen {
+            width: 100vw !important;
+            height: 100vh !important;
+            background: #000 !important;
+        }
+        .pip-web-fullscreen-container:fullscreen .pip-web-fs-player,
+        .pip-web-fs-player:fullscreen video {
+            width: 100% !important;
+            height: 100% !important;
         }
         .pip-web-fs-player {
             position: fixed !important;
@@ -537,6 +548,44 @@
         return chain;
     }
 
+    function getWebFullscreenNativeTarget() {
+        if (!webFullscreenSession) return null;
+        return webFullscreenSession.overlay || webFullscreenSession.container || webFullscreenSession.video || null;
+    }
+
+    function refreshWebFullscreenLayout() {
+        if (!webFullscreenSession) return;
+        const { video, container, overlay } = webFullscreenSession;
+        [overlay, container, video].forEach(el => {
+            if (!el) return;
+            el.style.setProperty('width', '100%', 'important');
+            el.style.setProperty('height', '100%', 'important');
+        });
+        video.style.setProperty('max-width', '100vw', 'important');
+        video.style.setProperty('max-height', '100vh', 'important');
+        refreshVideoRendering(video);
+    }
+
+    async function toggleNativeFullscreenFromWebFullscreen() {
+        const target = getWebFullscreenNativeTarget();
+        if (!target || typeof target.requestFullscreen !== 'function') return false;
+
+        try {
+            if (document.fullscreenElement) {
+                await document.exitFullscreen();
+            } else {
+                await target.requestFullscreen({ navigationUI: 'hide' });
+            }
+            refreshWebFullscreenLayout();
+            window.dispatchEvent(new Event('resize'));
+            requestAnimationFrame(refreshWebFullscreenLayout);
+            return true;
+        } catch (err) {
+            log('warn', `网页全屏内切换原生全屏失败: ${err.name}: ${err.message}`);
+            return false;
+        }
+    }
+
     function toggleWebFullscreen() {
         ensureWebFullscreenStyle();
         const allVideos = findVideosDeep().filter(v => v.readyState >= 2);
@@ -638,6 +687,14 @@
             return;
         }
 
+        if (key === 'f' && webFullscreenSession) {
+            e.preventDefault();
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            toggleNativeFullscreenFromWebFullscreen();
+            return;
+        }
+
         if (key === 'p' || key === 'q') {
             e.preventDefault();
             e.stopPropagation();
@@ -646,6 +703,18 @@
             else if (key === 'q') toggleWebFullscreen();
         }
     }, true);
+
+    document.addEventListener('fullscreenchange', () => {
+        if (!webFullscreenSession) return;
+        refreshWebFullscreenLayout();
+        window.dispatchEvent(new Event('resize'));
+        requestAnimationFrame(refreshWebFullscreenLayout);
+    });
+
+    window.addEventListener('resize', () => {
+        if (!webFullscreenSession) return;
+        requestAnimationFrame(refreshWebFullscreenLayout);
+    });
 
     let scanTimeout = null;
     const observer = new MutationObserver(mutations => {

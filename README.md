@@ -9,6 +9,7 @@
 *   **⌨️ 快捷键支持**：
     *   `P` 键：手动开启或关闭画中画（支持播放/暂停视频）。
     *   `Q` 键：切换**网页全屏**（视频铺满浏览器窗口）。
+    *   `F` 键：在网页全屏状态下切换浏览器原生全屏，避免站点播放器二次全屏导致黑屏。
 *   **🛡️ 运行稳定**：优先依赖浏览器自动 PiP 能力处理标签切换，并注册 Media Session 自动 PiP 处理器，同时对手动 PiP、回页退出和动态播放器做兼容增强。
 
 ## 💡 使用技巧（必读）
@@ -53,6 +54,7 @@ const CONFIG = {
 3. 如果没有自动弹出，请手动全选复制页面代码，并在 Tampermonkey 中新建脚本粘贴保存。
 
 ## 📜 版本记录
+*   **v4.13.12**: 修复先按 `Q` 进入网页全屏、再按 `F` 进入原生全屏时可能黑屏的问题；网页全屏状态下由脚本接管 `F` 并同步全屏布局。
 *   **v4.13.11**: 将脚本提前到 `document-start` 注入以尽早 hook Media Session；页面设置或清空 `enterpictureinpicture` handler 都视为页面接管，避免覆盖站点自己的 PiP 策略。
 *   **v4.13.10**: 包装 `navigator.mediaSession.setActionHandler`，当页面后续接管 `enterpictureinpicture` 时不再反复覆盖，并修复脚本 handler 被页面清除后状态标记失真的问题。
 *   **v4.13.9**: 注册 `navigator.mediaSession.setActionHandler('enterpictureinpicture', ...)`，修复部分 Chromium 中第一次切换标签页也不会自动进入画中画的问题。
