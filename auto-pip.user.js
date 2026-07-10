@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频自动画中画
 // @namespace    http://tampermonkey.net/
-// @version      4.13.12
+// @version      4.13.13
 // @description  自动画中画，支持标签页切换、窗口失焦触发、回页自动退出，支持网页全屏
 // @author       mankaki
 // @match        *://*/*
@@ -198,12 +198,12 @@
         });
     }
 
-    async function exitPiP() {
+    async function exitPiP(pipDocument = document) {
         if (!CONFIG.enabled || Date.now() - lastActionTime < ACTION_COOLDOWN) return;
-        if (document.pictureInPictureElement) {
+        if (pipDocument.pictureInPictureElement) {
             try {
                 lastActionTime = Date.now();
-                await document.exitPictureInPicture();
+                await pipDocument.exitPictureInPicture();
                 log('info', '返回页面, 自动退出画中画');
             } catch (err) { }
         }
@@ -245,7 +245,8 @@
     // 深度搜索视频元素 (支持 Shadow DOM)
     function findVideosDeep(root = document) {
         let videos = Array.from(root.querySelectorAll('video'));
-        const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, null, false);
+        const rootDocument = root.ownerDocument || root;
+        const walker = rootDocument.createTreeWalker(root, 1, null, false);
         let node;
         while (node = walker.nextNode()) {
             if (node.shadowRoot) {
@@ -253,6 +254,36 @@
             }
         }
         return videos;
+    }
+
+    // 收集当前文档及可直接访问的同源 iframe 文档。
+    // 键盘事件不会跨 browsing context 冒泡，因此外层页面收到快捷键时，
+    // 需要主动查找同源播放器 iframe；跨域 iframe 仍由其自身获得焦点后处理。
+    function getSameOriginDocuments(rootDocument = document, visited = new Set()) {
+        if (!rootDocument || visited.has(rootDocument)) return [];
+        visited.add(rootDocument);
+
+        const documents = [rootDocument];
+        const frames = rootDocument.querySelectorAll('iframe, frame');
+        for (const frame of frames) {
+            try {
+                const frameDocument = frame.contentDocument;
+                if (frameDocument) {
+                    documents.push(...getSameOriginDocuments(frameDocument, visited));
+                }
+            } catch (err) {
+                // 跨域 frame 无法直接访问，由注入该 frame 的脚本在其获得焦点时处理。
+            }
+        }
+        return documents;
+    }
+
+    function findVideosAcrossSameOriginFrames() {
+        return getSameOriginDocuments().flatMap(frameDocument => findVideosDeep(frameDocument));
+    }
+
+    function getActivePiPDocumentAcrossSameOriginFrames() {
+        return getSameOriginDocuments().find(frameDocument => frameDocument.pictureInPictureElement) || null;
     }
 
     // 全局单例重置尺寸监听器，避免为每个未达到尺寸的视频单独创建而引发内存泄露
@@ -444,11 +475,12 @@
     }
 
     async function toggleManualPiP() {
-        if (document.pictureInPictureElement) {
-            await exitPiP();
+        const activePiPDocument = getActivePiPDocumentAcrossSameOriginFrames();
+        if (activePiPDocument) {
+            await exitPiP(activePiPDocument);
             return;
         }
-        const allVideos = findVideosDeep().filter(v => v.readyState >= 2);
+        const allVideos = findVideosAcrossSameOriginFrames().filter(v => v.readyState >= 2);
         if (allVideos.length === 0) return;
         let target = allVideos.find(v => !v.paused) || allVideos[0];
         if (target) await enterPiP(target, '快捷键 P');
@@ -849,7 +881,7 @@
     }, true);
 
     function init() {
-        log('info', `脚本已加载 v4.13.11 [${window.self === window.top ? 'Main' : 'Iframe'}]`);
+        log('info', `脚本已加载 v4.13.13 [${window.self === window.top ? 'Main' : 'Iframe'}]`);
         if (CONFIG.isMgtv) log('info', '检测到 MGTV, 已应用增强兼容性配置。');
         if (!CONFIG.shortcutsOnlyMode) {
             installMediaSessionAutoPiPHandler();

@@ -54,6 +54,7 @@ const CONFIG = {
 3. 如果没有自动弹出，请手动全选复制页面代码，并在 Tampermonkey 中新建脚本粘贴保存。
 
 ## 📜 版本记录
+*   **v4.13.13**: 修复视频位于同源 iframe 时，焦点停留在外层页面按 `P` 无法进入或退出画中画的问题；快捷键现在会递归查找同源 iframe 中的播放器。
 *   **v4.13.12**: 修复先按 `Q` 进入网页全屏、再按 `F` 进入原生全屏时可能黑屏的问题；网页全屏状态下由脚本接管 `F` 并同步全屏布局。
 *   **v4.13.11**: 将脚本提前到 `document-start` 注入以尽早 hook Media Session；页面设置或清空 `enterpictureinpicture` handler 都视为页面接管，避免覆盖站点自己的 PiP 策略。
 *   **v4.13.10**: 包装 `navigator.mediaSession.setActionHandler`，当页面后续接管 `enterpictureinpicture` 时不再反复覆盖，并修复脚本 handler 被页面清除后状态标记失真的问题。
