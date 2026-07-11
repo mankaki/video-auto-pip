@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频自动画中画
 // @namespace    http://tampermonkey.net/
-// @version      4.13.13
+// @version      4.13.31
 // @description  自动画中画，支持标签页切换、窗口失焦触发、回页自动退出，支持网页全屏
 // @author       mankaki
 // @match        *://*/*
@@ -15,6 +15,7 @@
 
     const HOSTNAME = location.hostname;
     const isAliyunDrive = HOSTNAME.includes('aliyundrive.com');
+    const isBilibili = HOSTNAME === 'bilibili.com' || HOSTNAME.endsWith('.bilibili.com');
 
     const CONFIG = {
         enabled: true,
@@ -50,6 +51,11 @@
     let mediaSessionAutoPiPOverriddenByPage = false;
     let mediaSessionSetActionHandlerHooked = false;
     const observedVideos = new Set();
+    const documentPiPWindowsWithShortcuts = new WeakSet();
+    let bilibiliDocumentPiPClosingUntil = 0;
+    let bilibiliDocumentPiPRearmTimer = null;
+    let bilibiliManualPiPTransitionInFlight = false;
+    const BILIBILI_DOCUMENT_PIP_CLOSE_GRACE = 1500;
     let webFullscreenStyleInjected = false;
 
     installVideoCreationHook();
@@ -121,6 +127,8 @@
     function markVideoForNativeAutoPiP(video) {
         if (!video || !video.isConnected && video.ownerDocument !== document) return;
         video.removeAttribute('disablepictureinpicture');
+        // 保留该属性作为 Chromium 自动 PiP 资格标记。
+        // B 站新版按钮仅用于手动 P，自动切页继续使用稳定的原生路径。
         video.setAttribute('autopictureinpicture', '');
         if (typeof video.autoPictureInPicture !== 'undefined' && video.autoPictureInPicture !== true) {
             video.autoPictureInPicture = true;
@@ -200,6 +208,11 @@
 
     async function exitPiP(pipDocument = document) {
         if (!CONFIG.enabled || Date.now() - lastActionTime < ACTION_COOLDOWN) return;
+        const documentPiPWindow = isBilibili ? getActiveDocumentPiPWindowAcrossSameOriginFrames() : null;
+        if (documentPiPWindow) {
+            closeDocumentPiPWindow(documentPiPWindow, '返回页面, 自动退出 Document Picture-in-Picture');
+            return;
+        }
         if (pipDocument.pictureInPictureElement) {
             try {
                 lastActionTime = Date.now();
@@ -286,6 +299,82 @@
         return getSameOriginDocuments().find(frameDocument => frameDocument.pictureInPictureElement) || null;
     }
 
+    function getActiveDocumentPiPWindowAcrossSameOriginFrames() {
+        for (const frameDocument of getSameOriginDocuments()) {
+            const pipWindow = frameDocument.defaultView?.documentPictureInPicture?.window;
+            if (pipWindow && !pipWindow.closed) return pipWindow;
+        }
+        return null;
+    }
+
+    function isBilibiliDocumentPiPClosing() {
+        return isBilibili && Date.now() < bilibiliDocumentPiPClosingUntil;
+    }
+
+    function beginBilibiliDocumentPiPClose() {
+        if (!isBilibili) return;
+        bilibiliDocumentPiPClosingUntil = Math.max(
+            bilibiliDocumentPiPClosingUntil,
+            Date.now() + BILIBILI_DOCUMENT_PIP_CLOSE_GRACE
+        );
+        if (bilibiliDocumentPiPRearmTimer) clearTimeout(bilibiliDocumentPiPRearmTimer);
+        const rearmDelay = Math.max(0, bilibiliDocumentPiPClosingUntil - Date.now()) + 50;
+        bilibiliDocumentPiPRearmTimer = setTimeout(() => {
+            bilibiliDocumentPiPRearmTimer = null;
+            if (!CONFIG.enabled) return;
+            scheduleNativeAutoPiPRearm('B 站 Document PiP 关闭恢复完成');
+        }, rearmDelay);
+    }
+
+    function closeDocumentPiPWindow(pipWindow, reason) {
+        if (!pipWindow || pipWindow.closed) return false;
+        beginBilibiliDocumentPiPClose();
+        pipWindow.close();
+        log('info', reason);
+        return true;
+    }
+
+    function refreshBilibiliPlayerAfterDocumentPiP() {
+        if (!isBilibili) return;
+        [0, 120, 500].forEach(delay => {
+            setTimeout(() => {
+                const video = findVideosDeep().find(item => !item.paused && item.readyState >= 1)
+                    || findVideosDeep().find(item => item.readyState >= 1);
+                if (video?.ownerDocument === document) refreshVideoRendering(video);
+                window.dispatchEvent(new Event('resize'));
+            }, delay);
+        });
+    }
+
+    function attachDocumentPiPShortcuts(pipWindow) {
+        if (!pipWindow || pipWindow.closed || documentPiPWindowsWithShortcuts.has(pipWindow)) return;
+        documentPiPWindowsWithShortcuts.add(pipWindow);
+        pipWindow.addEventListener('pagehide', () => {
+            beginBilibiliDocumentPiPClose();
+            refreshBilibiliPlayerAfterDocumentPiP();
+        }, { once: true });
+        pipWindow.document.addEventListener('keydown', event => {
+            const target = event.target;
+            const tagName = target?.tagName?.toLowerCase();
+            if (target?.isContentEditable || tagName === 'input' || tagName === 'textarea' || tagName === 'select') return;
+            if (event.key?.toLowerCase() !== 'p') return;
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation();
+            closeDocumentPiPWindow(pipWindow, '在 Document Picture-in-Picture 窗口内按 P 退出画中画');
+        }, true);
+    }
+
+    function installDocumentPiPShortcutBridge() {
+        const controller = window.documentPictureInPicture;
+        if (!isBilibili || !controller || document.__pipDocumentShortcutBridgeInstalled) return;
+        document.__pipDocumentShortcutBridgeInstalled = true;
+        controller.addEventListener('enter', event => {
+            attachDocumentPiPShortcuts(event.window || controller.window);
+        });
+        attachDocumentPiPShortcuts(controller.window);
+    }
+
     // 全局单例重置尺寸监听器，避免为每个未达到尺寸的视频单独创建而引发内存泄露
     const SharedResizeObserver = new ResizeObserver((entries) => {
         for (let entry of entries) {
@@ -369,7 +458,7 @@
     }
 
     function scheduleNativeAutoPiPRearm(reason) {
-        if (CONFIG.conservativePiPRearm) return;
+        if (CONFIG.conservativePiPRearm || isBilibiliDocumentPiPClosing()) return;
         enforceAllNativeAutoPiP();
         installMediaSessionAutoPiPHandler();
         [120, 500, 1200].forEach(delay => {
@@ -396,7 +485,10 @@
     function createMediaSessionAutoPiPHandler() {
         if (mediaSessionAutoPiPHandler) return mediaSessionAutoPiPHandler;
         mediaSessionAutoPiPHandler = async () => {
-            if (!CONFIG.enabled || document.pictureInPictureElement) return;
+            if (!CONFIG.enabled
+                || document.pictureInPictureElement
+                || getActiveDocumentPiPWindowAcrossSameOriginFrames()
+                || isBilibiliDocumentPiPClosing()) return;
             const video = getBestAutoPiPVideo();
             if (!video) {
                 log('debug', '浏览器请求自动画中画，但未找到可用播放视频');
@@ -475,15 +567,110 @@
     }
 
     async function toggleManualPiP() {
+        const documentPiPWindow = isBilibili ? getActiveDocumentPiPWindowAcrossSameOriginFrames() : null;
+        if (documentPiPWindow) {
+            closeDocumentPiPWindow(documentPiPWindow, '已通过快捷键 P 关闭 Document Picture-in-Picture 窗口');
+            return;
+        }
         const activePiPDocument = getActivePiPDocumentAcrossSameOriginFrames();
+        const allVideos = findVideosAcrossSameOriginFrames().filter(v => v.readyState >= 2);
+        const target = allVideos.find(v => !v.paused) || allVideos[0];
+
+        // 标准 Video PiP 必须通过 Document API 退出，不能再点击 B 站的进入按钮。
         if (activePiPDocument) {
             await exitPiP(activePiPDocument);
             return;
         }
-        const allVideos = findVideosAcrossSameOriginFrames().filter(v => v.readyState >= 2);
+
+        // B 站的开启和退出必须使用同一个播放器开关，避免站内状态与原生 API 状态脱节。
+        if (isBilibili && target) {
+            if (bilibiliManualPiPTransitionInFlight) {
+                log('debug', 'B 站手动画中画正在切换，忽略重复 P 键');
+                return;
+            }
+            bilibiliManualPiPTransitionInFlight = true;
+            try {
+                const enteredThroughBilibili = await clickBilibiliPiPButton(target);
+                if (enteredThroughBilibili) return;
+                if (getActivationState().isActive) {
+                    await enterPiP(target, '快捷键 P（B 站按钮未进入后兜底）');
+                } else {
+                    log('warn', 'B 站画中画按钮未成功，且当前按键的用户激活已失效；可再按一次 P 重试');
+                }
+            } finally {
+                bilibiliManualPiPTransitionInFlight = false;
+            }
+            return;
+        }
         if (allVideos.length === 0) return;
-        let target = allVideos.find(v => !v.paused) || allVideos[0];
         if (target) await enterPiP(target, '快捷键 P');
+    }
+
+    // B 站的按钮会先走播放器自己的 PiP 状态和兼容逻辑。
+    // 控件不存在时再回退到 video.requestPictureInPicture() 。
+    async function clickBilibiliPiPButton(video) {
+        const selectors = [
+            '.bpx-player-ctrl-pip',
+            '.bilibili-player-video-btn-pip',
+            '[aria-label*="画中画"]',
+            '[title*="画中画"]'
+        ].join(',');
+        const playerSelectors = [
+            '#bilibili-player',
+            '.bpx-player-container',
+            '.bilibili-player'
+        ].join(',');
+
+        const videoDocument = video?.ownerDocument;
+        if (!videoDocument) return false;
+
+        // B 站切 P/换集后可能暂时保留旧播放器 DOM，必须从当前视频反查所属播放器。
+        const currentPlayer = video.closest(playerSelectors);
+        const candidates = currentPlayer
+            ? Array.from(currentPlayer.querySelectorAll(selectors))
+            : Array.from(videoDocument.querySelectorAll(selectors));
+
+        for (const button of candidates) {
+            if (!button.isConnected || button.matches('[disabled], [aria-disabled="true"]')) continue;
+            const style = videoDocument.defaultView?.getComputedStyle(button);
+            const isVisible = button.getClientRects().length > 0
+                && style?.display !== 'none'
+                && style?.visibility !== 'hidden';
+            if (!isVisible) continue;
+            const documentPiPController = videoDocument.defaultView?.documentPictureInPicture;
+            const entered = await new Promise(resolve => {
+                let settled = false;
+                const hasActivePiP = () => {
+                    const videoPiPActive = !!videoDocument.pictureInPictureElement;
+                    const documentPiPActive = !!documentPiPController?.window && !documentPiPController.window.closed;
+                    return videoPiPActive || documentPiPActive;
+                };
+                const finish = success => {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timeout);
+                    videoDocument.removeEventListener('enterpictureinpicture', onVideoEnter, true);
+                    documentPiPController?.removeEventListener('enter', onDocumentEnter);
+                    resolve(success);
+                };
+                const onVideoEnter = () => finish(true);
+                const onDocumentEnter = () => finish(true);
+                const timeout = setTimeout(() => finish(hasActivePiP()), 400);
+
+                videoDocument.addEventListener('enterpictureinpicture', onVideoEnter, { capture: true, once: true });
+                documentPiPController?.addEventListener('enter', onDocumentEnter, { once: true });
+                button.click();
+
+                queueMicrotask(() => {
+                    if (hasActivePiP()) finish(true);
+                });
+            });
+            log(entered ? 'info' : 'warn', entered
+                ? '已确认通过当前 B 站播放器的自带按钮进入画中画'
+                : 'B 站播放器按钮已点击，但未观测到画中画成功事件');
+            return entered;
+        }
+        return false;
     }
 
     function findPlayerContainer(video) {
@@ -778,7 +965,7 @@
         const activation = getActivationState();
         log('info', `>>> blur 触发! enabled=${CONFIG.enabled}, pipEl=${!!document.pictureInPictureElement}, hidden=${document.hidden}, hasFocus=${document.hasFocus()}, activeEl=${document.activeElement?.tagName}, iframePending=${iframeBlurPending}, activation=${activation.isActive}/${activation.hasBeenActive}, everInteracted=${hasEverInteracted}`);
 
-        if (!CONFIG.enabled || document.pictureInPictureElement || document.hidden) {
+        if (!CONFIG.enabled || document.pictureInPictureElement || getActiveDocumentPiPWindowAcrossSameOriginFrames() || document.hidden) {
             log('debug', '前置条件不满足，跳过。');
             return;
         }
@@ -881,8 +1068,9 @@
     }, true);
 
     function init() {
-        log('info', `脚本已加载 v4.13.13 [${window.self === window.top ? 'Main' : 'Iframe'}]`);
+        log('info', `脚本已加载 v4.13.31 [${window.self === window.top ? 'Main' : 'Iframe'}]`);
         if (CONFIG.isMgtv) log('info', '检测到 MGTV, 已应用增强兼容性配置。');
+        installDocumentPiPShortcutBridge();
         if (!CONFIG.shortcutsOnlyMode) {
             installMediaSessionAutoPiPHandler();
             scanVideos();
