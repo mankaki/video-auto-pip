@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         视频自动画中画
 // @namespace    http://tampermonkey.net/
-// @version      4.13.31
-// @description  自动画中画，支持标签页切换、窗口失焦触发、回页自动退出，支持网页全屏
+// @version      4.13.32
+// @description  自动画中画，支持标签页切换、可选窗口失焦触发、回页自动退出，支持网页全屏
 // @author       mankaki
 // @match        *://*/*
 // @grant        none
@@ -20,6 +20,8 @@
     const CONFIG = {
         enabled: true,
         debug: false,
+        // 点击页面后离开浏览器时尝试自动入 PiP；扩展弹窗失焦由工具栏保护逻辑拦截。
+        autoPiPOnWindowBlur: true,
         // 原生自动 PiP 在部分 Chromium/站点中被脚本关闭后，下一轮自动进入会要求重新点击页面。
         // auto-close: 回页自动关闭 PiP，但这类站点可能需要再次点击页面才会触发下一轮自动 PiP。
         // continuous: 不自动关闭原生自动 PiP，优先保证反复切 tab 都能继续自动进入。
@@ -40,6 +42,7 @@
 
     let hasEverInteracted = false;
     let iframeBlurPending = false; // 标记：是否刚点击了 iframe 等嵌入元素（可能导致假 blur）
+    let pointerInBrowserChrome = false; // 鼠标从页面顶部离开后，视为位于浏览器工具栏
     let webFullscreenSession = null;
     let returnToPageTimer = null;
     let lastPipVideo = null;
@@ -56,6 +59,7 @@
     let bilibiliDocumentPiPRearmTimer = null;
     let bilibiliManualPiPTransitionInFlight = false;
     const BILIBILI_DOCUMENT_PIP_CLOSE_GRACE = 1500;
+    const BROWSER_CHROME_GUARD_MESSAGE = '__videoAutoPiPBrowserChromeGuardV41332__';
     let webFullscreenStyleInjected = false;
 
     installVideoCreationHook();
@@ -959,9 +963,76 @@
         }
     });
 
+    function isDirectChildWindow(source) {
+        for (let index = 0; index < window.frames.length; index += 1) {
+            if (window.frames[index] === source) return true;
+        }
+        return false;
+    }
+
+    function sendBrowserChromeGuardState(target, active = pointerInBrowserChrome) {
+        try {
+            target.postMessage({ type: BROWSER_CHROME_GUARD_MESSAGE, active }, '*');
+        } catch (err) { }
+    }
+
+    function setBrowserChromeGuardState(active) {
+        if (pointerInBrowserChrome === active) return;
+        pointerInBrowserChrome = active;
+        // 每层 frame 只向直接子 frame 转发，从而覆盖任意深度和跨域的播放器。
+        for (let index = 0; index < window.frames.length; index += 1) {
+            sendBrowserChromeGuardState(window.frames[index], active);
+        }
+    }
+
+    window.addEventListener('message', (event) => {
+        const data = event.data;
+        if (!data || data.type !== BROWSER_CHROME_GUARD_MESSAGE) return;
+
+        if (data.request === true) {
+            if (isDirectChildWindow(event.source)) {
+                sendBrowserChromeGuardState(event.source);
+            }
+            return;
+        }
+
+        // 子 frame 只接受直接父 frame 同步的状态，避免页面内其他 frame 伪造保护信号。
+        if (window !== window.top && event.source === window.parent && typeof data.active === 'boolean') {
+            setBrowserChromeGuardState(data.active);
+        }
+    }, true);
+
+    if (window === window.top) {
+        // 只有顶层页面的顶边才通往浏览器 UI；iframe 顶边不能作为判定信号。
+        // 必须早于 blur 监听器安装，以覆盖 DOMContentLoaded 之前点击扩展的场景。
+        window.addEventListener('mouseout', (e) => {
+            if (e.relatedTarget === null && e.clientY <= 0) {
+                setBrowserChromeGuardState(true);
+                log('debug', '鼠标从页面顶部离开，启用浏览器 UI 失焦保护。');
+            }
+        }, true);
+
+        window.addEventListener('mouseover', () => {
+            setBrowserChromeGuardState(false);
+        }, true);
+    } else {
+        // 动态创建的 frame 可能错过之前的广播，加载时向父 frame 请求当前状态。
+        try {
+            window.parent.postMessage({ type: BROWSER_CHROME_GUARD_MESSAGE, request: true }, '*');
+        } catch (err) { }
+    }
+
     window.addEventListener('blur', () => {
         if (CONFIG.shortcutsOnlyMode) return;
         if (CONFIG.minimalMode) return;
+        if (!CONFIG.autoPiPOnWindowBlur) {
+            log('debug', '已关闭窗口失焦自动画中画，忽略 blur。');
+            return;
+        }
+        if (pointerInBrowserChrome) {
+            log('debug', '鼠标位于浏览器工具栏，忽略扩展弹窗或浏览器 UI 导致的 blur。');
+            return;
+        }
         const activation = getActivationState();
         log('info', `>>> blur 触发! enabled=${CONFIG.enabled}, pipEl=${!!document.pictureInPictureElement}, hidden=${document.hidden}, hasFocus=${document.hasFocus()}, activeEl=${document.activeElement?.tagName}, iframePending=${iframeBlurPending}, activation=${activation.isActive}/${activation.hasBeenActive}, everInteracted=${hasEverInteracted}`);
 
@@ -1068,7 +1139,7 @@
     }, true);
 
     function init() {
-        log('info', `脚本已加载 v4.13.31 [${window.self === window.top ? 'Main' : 'Iframe'}]`);
+        log('info', `脚本已加载 v4.13.32 [${window.self === window.top ? 'Main' : 'Iframe'}]`);
         if (CONFIG.isMgtv) log('info', '检测到 MGTV, 已应用增强兼容性配置。');
         installDocumentPiPShortcutBridge();
         if (!CONFIG.shortcutsOnlyMode) {
