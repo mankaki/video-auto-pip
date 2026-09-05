@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频自动画中画
 // @namespace    http://tampermonkey.net/
-// @version      4.13.32
+// @version      4.13.33
 // @description  自动画中画，支持标签页切换、可选窗口失焦触发、回页自动退出，支持网页全屏
 // @author       mankaki
 // @match        *://*/*
@@ -106,6 +106,15 @@
             height: 100vh !important;
             z-index: 2147483647 !important;
             background: #000 !important;
+        }
+        #cloud-director-container.pip-web-fs-player > .player-container {
+            position: absolute !important;
+            top: 50% !important;
+            left: 50% !important;
+            transform: translate(-50%, -50%) !important;
+            width: calc(100% - 20px) !important;
+            max-width: calc(177.77778vh - 20px) !important;
+            height: auto !important;
         }
         body.pip-web-fs-active {
             overflow: hidden !important;
@@ -704,12 +713,25 @@
         return candidate;
     }
 
-    function exitWebFullscreen() {
+    async function exitWebFullscreen() {
         if (!webFullscreenSession) return;
+        if (webFullscreenSession.exiting) return false;
         const { mode } = webFullscreenSession;
 
         if (mode === 'inplace') {
             const { container, previousStyle, chain } = webFullscreenSession;
+            const fullscreenElement = document.fullscreenElement;
+            if (fullscreenElement && container.contains(fullscreenElement)) {
+                webFullscreenSession.exiting = true;
+                try {
+                    await document.exitFullscreen();
+                } catch (err) {
+                    log('warn', `退出原生全屏失败: ${err.name}: ${err.message}`);
+                    return false;
+                } finally {
+                    webFullscreenSession.exiting = false;
+                }
+            }
             container.classList.remove('pip-web-fs-player');
             if (previousStyle === null) container.removeAttribute('style');
             else container.setAttribute('style', previousStyle);
@@ -755,6 +777,7 @@
         document.body.classList.remove('pip-web-fs-active');
         webFullscreenSession = null;
         log('info', '退出网页全屏');
+        return true;
     }
 
     function buildFullscreenChain(video, container) {
@@ -778,6 +801,8 @@
 
     function refreshWebFullscreenLayout() {
         if (!webFullscreenSession) return;
+        // 直播多机位由站点维护各视频尺寸，不能把某一路视频强制拉满。
+        if (webFullscreenSession.mode === 'inplace') return;
         const { video, container, overlay } = webFullscreenSession;
         [overlay, container, video].forEach(el => {
             if (!el) return;
@@ -790,6 +815,7 @@
     }
 
     async function toggleNativeFullscreenFromWebFullscreen() {
+        if (webFullscreenSession?.exiting) return false;
         const target = getWebFullscreenNativeTarget();
         if (!target || typeof target.requestFullscreen !== 'function') return false;
 
@@ -809,7 +835,7 @@
         }
     }
 
-    function toggleWebFullscreen() {
+    async function toggleWebFullscreen() {
         ensureWebFullscreenStyle();
         const allVideos = findVideosDeep().filter(v => v.readyState >= 2);
         if (allVideos.length === 0) return;
@@ -818,12 +844,24 @@
 
         const container = findPlayerContainer(video);
         if (webFullscreenSession?.video === video) {
-            exitWebFullscreen();
+            await exitWebFullscreen();
             return;
         }
-        if (webFullscreenSession) exitWebFullscreen();
+        if (webFullscreenSession && !await exitWebFullscreen()) return;
 
         document.body.classList.add('pip-web-fs-active');
+
+        // 云导播的弹幕与统一音量控件是内部播放器的兄弟节点。
+        // 保留原 DOM 位置，以维持 .cloud-director 的样式和鼠标事件冒泡。
+        const liveContainer = CONFIG.isMgtv ? video.closest('#cloud-director-container') : null;
+        if (liveContainer) {
+            const previousStyle = liveContainer.getAttribute('style');
+            liveContainer.classList.add('pip-web-fs-player');
+            webFullscreenSession = { video, container: liveContainer, previousStyle, chain: [], mode: 'inplace' };
+            window.dispatchEvent(new Event('resize'));
+            log('info', '进入网页全屏 (芒果直播完整容器原位模式)');
+            return;
+        }
 
         if (container) {
             const previousStyle = container.getAttribute('style');
@@ -1139,7 +1177,7 @@
     }, true);
 
     function init() {
-        log('info', `脚本已加载 v4.13.32 [${window.self === window.top ? 'Main' : 'Iframe'}]`);
+        log('info', `脚本已加载 v4.13.33 [${window.self === window.top ? 'Main' : 'Iframe'}]`);
         if (CONFIG.isMgtv) log('info', '检测到 MGTV, 已应用增强兼容性配置。');
         installDocumentPiPShortcutBridge();
         if (!CONFIG.shortcutsOnlyMode) {
