@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Syntax check
+        run: |
+          for f in *.user.js; do
+            echo "checking $f"
+            node --check "$f"
+          done
+
+      - name: Version bumped (PR only)
+        if: github.event_name == 'pull_request'
+        run: |
+          f=auto-pip.user.js
+          base="origin/${{ github.base_ref }}"
+          if git diff --quiet "$base" -- "$f"; then
+            echo "script unchanged, skip"; exit 0
+          fi
+          old=$(git show "$base:$f" | grep -m1 '@version' | awk '{print $NF}')
+          new=$(grep -m1 '@version' "$f" | awk '{print $NF}')
+          echo "old=$old new=$new"
+          [ "$(printf '%s\n%s\n' "$old" "$new" | sort -V | tail -1)" = "$new" ] && [ "$old" != "$new" ] \
+            || { echo "::error::脚本改了但 @version 没调高"; exit 1; }
+
+      - name: Tests (if any)
+        run: |
+          if [ -d tests ]; then node --test tests/*.test.*; else echo "no tests yet"; fi
